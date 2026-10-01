@@ -2,10 +2,13 @@
 
 mod claude;
 mod files;
+mod groq;
 mod hooks;
+mod hotkey;
 mod integrations;
 mod island;
 mod log;
+mod media;
 mod pipe;
 mod secrets;
 mod settings;
@@ -93,6 +96,9 @@ fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
     let pref = shared.settings.lock().unwrap().screen.clone();
     shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
     island::apply_geometry(&app, &pref, collapsed);
+    // Main thread: RevokeDragDrop must run where the drop target was registered.
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || island::unblock_webview_drops(&handle));
     // The wake strip must always take the mouse, and a resize invalidates the flag.
     island::set_ignore_cursor(&app, false);
     shared.gate.forget_ignore_state();
@@ -132,8 +138,28 @@ fn open_url(url: String) {
         .spawn();
 }
 
-/// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
-/// and falls back to Explorer otherwise.
+/// "Open terminal" opens a new Windows Terminal tab in the session's folder.
+/// Windows Terminal has no public way to focus an existing tab, so a new tab in
+/// the most recent window is the closest thing. Falls back to VS Code, then
+/// Explorer, when Windows Terminal is not installed.
+#[tauri::command]
+fn open_terminal(path: Option<String>) -> bool {
+    let dir = path.as_deref().filter(|p| !p.is_empty());
+    // `wt` is an app execution alias; CreateProcess resolves it from PATH, and
+    // no shell is involved. `;` separates wt commands, so it is escaped.
+    let mut wt = Command::new("wt.exe");
+    wt.args(["-w", "0", "nt"]);
+    if let Some(p) = dir {
+        wt.arg("-d").arg(p.replace(';', "\\;"));
+    }
+    if wt.spawn().is_ok() {
+        return true;
+    }
+    open_in_vscode(path)
+}
+
+/// Opens the working folder in VS Code when `code` is on PATH, and falls back to
+/// Explorer otherwise.
 #[tauri::command]
 fn open_in_vscode(path: Option<String>) -> bool {
     // No `cmd /C` anywhere near this. The path is a project folder chosen by
@@ -248,13 +274,72 @@ async fn chat_send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let (provider, model, groq_model) = {
+        let s = shared.settings.lock().unwrap();
+        (s.provider.clone(), s.model.clone(), s.groq_model.clone())
+    };
+    chat.use_provider(&provider);
+    if provider == "groq" {
+        groq::send(&chat, &groq_model, query, context).await
+    } else {
+        claude::send(&chat, &model, query, context).await
+    }
 }
 
 #[tauri::command]
 fn chat_reset(chat: State<Chat>) {
     chat.reset();
+}
+
+/// Calendar pill: downloads the secret iCal feed (Google Calendar's "secret
+/// address in iCal format"). The link stays in the Credential Manager and is
+/// never logged; the island only receives the calendar text and parses it.
+#[tauri::command]
+async fn calendar_fetch() -> Result<String, String> {
+    if integrations::PAUSED.load(Ordering::Relaxed) {
+        return Err("Paused".to_string());
+    }
+    let url = secrets::get("gcal-ics-url")
+        .ok_or_else(|| "Calendar link missing. Open settings.".to_string())?;
+    if !url.starts_with("https://") {
+        return Err("The calendar link must start with https://".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Coucou")
+        .send()
+        .await
+        .map_err(|_| "Network error while loading the calendar".to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        log::line(format!("calendar HTTP {}", status.as_u16()));
+        return Err(format!("Calendar link refused ({})", status.as_u16()));
+    }
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return Err("Calendar too large".to_string());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Media pill buttons: "toggle", "next" or "previous".
+#[tauri::command]
+fn media_control(action: String) {
+    media::control(action);
+}
+
+/// "Attach file": the standard Open dialog, as an alternative to dragging.
+#[tauri::command]
+async fn pick_file() -> Option<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(files::pick());
+    });
+    rx.await.ok().flatten()
 }
 
 /// Copies a dropped file into the inbox and reports its name back.
@@ -306,7 +391,7 @@ fn log_line(message: String) {
 /// for the *same* arguments as the island (see `additionalBrowserArgs` in
 /// tauri.conf.json) — a mismatch makes the second window come up blank, with no
 /// error anywhere.
-const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
+const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --renderer-process-limit=1";
 
 /// In a dev build the pages are served by Vite, so the second window needs the
 /// absolute dev URL; a bundled build resolves it inside the app bundle.
@@ -389,6 +474,7 @@ pub fn run() {
             reposition,
             open_url,
             open_in_vscode,
+            open_terminal,
             quit_app,
             hooks_status,
             hooks_preview,
@@ -398,6 +484,9 @@ pub fn run() {
             approval_decline,
             log_line,
             chat_send,
+            pick_file,
+            media_control,
+            calendar_fetch,
             chat_reset,
             ingest_file,
             secret_present,
@@ -422,11 +511,14 @@ pub fn run() {
             gate.collapsed.store(false, Ordering::Relaxed);
             gate.set_active(true);
             island::spawn_cursor_poll(handle.clone(), gate.clone());
+            island::spawn_drop_guard(handle.clone());
 
             log::line(format!("--- Coucou {} started ---", env!("CARGO_PKG_VERSION")));
             hooks::ensure_hook_exe(&handle);
             pipe::start(handle.clone());
             integrations::start(handle.clone());
+            media::start(handle.clone());
+            hotkey::start(handle.clone());
             Ok(())
         })
         .run(tauri::generate_context!())

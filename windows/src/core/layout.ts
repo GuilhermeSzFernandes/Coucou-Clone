@@ -21,6 +21,7 @@ export type IslandViewName =
   | "result"
   | "note"
   | "settings"
+  | "calendar"
   | "greeting";
 
 export type BotStateName =
@@ -85,6 +86,7 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   result: { height: 160, botX: 52, botY: null, botDiameter: 44, agentMode: "column" },
   note: { height: 160, botX: 60, botY: null, botDiameter: 50, agentMode: "column" },
   settings: { height: 160, botX: 54, botY: null, botDiameter: 46, agentMode: "none" },
+  calendar: { height: 300, botX: 50, botY: 84, botDiameter: 40, agentMode: "none" },
   greeting: { height: 150, botX: 320, botY: 90, botDiameter: 0, agentMode: "none" },
 };
 

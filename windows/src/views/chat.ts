@@ -10,6 +10,10 @@ import type { ViewHost } from "./views";
 
 let nextId = 1;
 
+/** Paperclip (stroke icon). */
+const PAPERCLIP =
+  "M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48";
+
 function bubble(message: ChatMessage): HTMLElement {
   if (message.role === "user") {
     return h(
@@ -46,7 +50,12 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     spellcheck: "false",
   }) as HTMLInputElement;
   const send = h("button", { class: "send-btn", title: "Send" }, svg(ICONS.arrowUp, 11));
-  const bar = h("div", { class: "chat-bar" }, input, send);
+  const attach = h(
+    "button",
+    { class: "attach-btn", title: "Attach a file" },
+    svg(PAPERCLIP, 14, { stroke: 2 }),
+  );
+  const bar = h("div", { class: "chat-bar" }, attach, input, send);
 
   const el = h(
     "div",
@@ -92,6 +101,35 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     }
   }
 
+  /**
+   * The alternative to dragging: pick a file with the Windows dialog. It lands
+   * in the inbox like a dropped file and starts a fresh conversation about it.
+   */
+  async function attachFile() {
+    if (sending) return;
+    State.isPinned = true; // keep the island open while the dialog is up
+    try {
+      const path = await Bridge.pickFile();
+      if (!path) return;
+      const file = await Bridge.ingestFile(path);
+      State.droppedFile = { name: file.name, path: file.path };
+      State.promptContext = { kind: "file", name: file.name, path: file.path };
+      State.chatHistory = [];
+      void Bridge.chatReset();
+      Sound.play("approve");
+    } catch (err) {
+      State.noteMessage = String(err).replace(/^Error:\s*/, "");
+      State.view = "note";
+      Sound.play("error");
+    } finally {
+      State.isPinned = false;
+      State.notify();
+      onHeightChange();
+      input.focus();
+    }
+  }
+
+  attach.addEventListener("click", () => void attachFile());
   send.addEventListener("click", () => void submit());
   input.addEventListener("keydown", (e) => {
     if ((e as KeyboardEvent).key === "Enter") {
@@ -124,6 +162,7 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
       input.placeholder = State.chatHistory.length === 0 ? "Ask me anything…" : "Continue…";
       input.disabled = sending;
+      (attach as HTMLButtonElement).disabled = sending;
     },
     focus() {
       input.focus();

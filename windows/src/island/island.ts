@@ -44,6 +44,8 @@ export class Island {
   private botGlow!: HTMLElement;
   private greetingCanvas!: HTMLCanvasElement;
   private miniGrid!: HTMLElement;
+  /** Pomodoro countdown shown in the middle of the compact island. */
+  private compactTimer!: HTMLElement;
   private countdown!: HTMLElement;
   private wakeStrip!: HTMLElement;
 
@@ -113,7 +115,7 @@ export class Island {
       },
       openTerminal: () => {
         const cwd = State.focusTask?.sessionCwd ?? null;
-        void Bridge.openInVSCode(cwd);
+        void Bridge.openTerminal(cwd);
       },
       // The ↗ button — same targets as openAgentTarget() on macOS.
       openTarget: () => {
@@ -126,8 +128,9 @@ export class Island {
           integration_stripe: "https://dashboard.stripe.com/payments",
           integration_notion: "https://notion.so",
           integration_calcom: "https://app.cal.com/bookings",
+          integration_calendar: "https://calendar.google.com",
         };
-        if (task.id === "integration_claude") void Bridge.openInVSCode(task.sessionCwd ?? null);
+        if (task.id === "integration_claude") void Bridge.openTerminal(task.sessionCwd ?? null);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
       },
@@ -174,6 +177,7 @@ export class Island {
     this.botCanvas = h("canvas", { id: "bot-canvas" });
     this.greetingCanvas = h("canvas", { id: "greeting-canvas" });
     this.miniGrid = h("div", { id: "mini-grid" });
+    this.compactTimer = h("div", { id: "compact-timer" });
     this.countdown = h("div", { id: "countdown" });
 
     this.header = buildHeader(actions);
@@ -208,6 +212,7 @@ export class Island {
       this.botGlow,
       this.botCanvas,
       this.miniGrid,
+      this.compactTimer,
       this.countdown,
     );
 
@@ -481,6 +486,8 @@ export class Island {
     // the state-driven DOM sync.
     this.miniGrid.style.left = `${w - 40 - 14.5}px`;
     this.miniGrid.style.top = `${hh / 2 - 14.5}px`;
+    this.compactTimer.style.left = `${w / 2}px`;
+    this.compactTimer.style.top = `${hh / 2}px`;
     this.greetingCanvas.style.left = `${(w - EXPANDED_W) / 2}px`;
     this.uploadCanvas.el.style.left = `${(w - EXPANDED_W) / 2}px`;
 
@@ -865,6 +872,22 @@ export class Island {
       }
     }
 
+    // Pomodoro in the compact island: while it runs, or paused part-way.
+    const pomo = State.integrations.integration_pomodoro?.data as
+      | { running?: boolean; remaining?: number; total?: number; phase?: string }
+      | undefined;
+    const pomoOn = State.settings.activeIntegrations.includes("integration_pomodoro");
+    const started = !!pomo && (pomo.running === true || Number(pomo.remaining) < Number(pomo.total));
+    const showTimer = State.mode === "compact" && pomoOn && started;
+    this.compactTimer.style.opacity = showTimer ? "1" : "0";
+    if (showTimer && pomo) {
+      const s = Math.max(0, Math.round(Number(pomo.remaining ?? 0)));
+      const text = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+      if (this.compactTimer.textContent !== text) this.compactTimer.textContent = text;
+      this.compactTimer.classList.toggle("break", pomo.phase !== "focus");
+      this.compactTimer.classList.toggle("paused", pomo.running !== true);
+    }
+
     syncMiniBotStates(State.tasks);
     this.engine.setState(State.effectiveState);
   }
@@ -874,6 +897,14 @@ export class Island {
     Sound.setEnabled(State.settings.soundEnabled);
     Sound.setVolume(State.settings.soundVolume);
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
+    const keep = State.settings.keepVisible === true;
+    const turnedOn = keep && !this.fsm.keepVisible;
+    this.fsm.keepVisible = keep;
+    if (turnedOn) {
+      // Bring it back now, and cancel a hide that was already counting down.
+      this.fsm.cancelTimers();
+      if (this.fsm.state === "hidden") this.fsm.reveal();
+    }
     State.notify();
   }
 

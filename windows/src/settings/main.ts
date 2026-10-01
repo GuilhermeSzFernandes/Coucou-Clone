@@ -254,6 +254,126 @@ function apiSection(hasKey: boolean): HTMLElement {
   );
 }
 
+// ── Chat provider + Groq section ──────────────────────────────────────────────
+
+const GROQ_MODELS: [string, string][] = [
+  ["openai/gpt-oss-120b", "GPT-OSS 120B"],
+  ["openai/gpt-oss-20b", "GPT-OSS 20B (faster)"],
+  ["qwen/qwen3.8-27b", "Qwen 3.8 27B (reads images)"],
+];
+
+function providerSection(): HTMLElement {
+  const select = h("select", {}) as HTMLSelectElement;
+  select.append(
+    h("option", { value: "anthropic", text: "Claude (Anthropic)" }),
+    h("option", { value: "groq", text: "Groq" }),
+  );
+  select.value = settings.provider ?? "anthropic";
+  select.addEventListener("change", () => {
+    settings.provider = select.value === "groq" ? "groq" : "anthropic";
+    void save();
+  });
+  return h(
+    "section",
+    {},
+    h("h2", {}, h("span", { text: "Chat" })),
+    h("span", {
+      class: "hint",
+      text: "Which AI answers when you chat or drop a file. Switching starts a new conversation.",
+    }),
+    h("div", { class: "row" }, h("label", { text: "Provider" }), select),
+  );
+}
+
+function groqSection(hasKey: boolean): HTMLElement {
+  const dot = statusDot(hasKey);
+  const state = h("span", { class: "hint", text: "" });
+
+  const field = h("input", {
+    type: "password",
+    placeholder: "gsk_...",
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+
+  const saveBtn = h("button", { class: "primary", text: "Save key" });
+  const clearBtn = h("button", { class: "danger", text: "Remove" });
+  const feedback = h("div", {});
+
+  function paint(present: boolean) {
+    dot.style.background = present ? "#22c55e" : "#f4505e";
+    state.textContent = present
+      ? "Key saved in the Windows Credential Manager."
+      : "No Groq key yet. Get one at console.groq.com/keys.";
+    field.placeholder = present ? "••••••••••••  (stored)" : "gsk_...";
+    clearBtn.style.display = present ? "" : "none";
+  }
+
+  async function refresh() {
+    paint((await Bridge.secretPresent("groq-api-key")) ?? false);
+  }
+
+  saveBtn.addEventListener("click", async () => {
+    const value = field.value.trim();
+    if (!value) return;
+    clear(feedback);
+    try {
+      await Bridge.secretSet("groq-api-key", value);
+      field.value = "";
+      feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
+      await refresh();
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
+    }
+  });
+
+  clearBtn.addEventListener("click", async () => {
+    clear(feedback);
+    try {
+      await Bridge.secretClear("groq-api-key");
+      feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
+      await refresh();
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
+    }
+  });
+
+  // Free text with suggestions: Groq's model list changes often.
+  const listId = "groq-models";
+  const datalist = h("datalist", { id: listId });
+  for (const [id, label] of GROQ_MODELS) datalist.append(h("option", { value: id, text: label }));
+  const model = h("input", {
+    type: "text",
+    list: listId,
+    style: "flex:1 1 auto;min-width:0",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  model.value = settings.groqModel ?? "openai/gpt-oss-120b";
+  model.addEventListener("change", () => {
+    const v = model.value.trim();
+    if (!v) return;
+    settings.groqModel = v;
+    void save();
+  });
+
+  paint(hasKey);
+
+  return h(
+    "section",
+    {},
+    h("h2", {}, dot, h("span", { text: "Groq" })),
+    state,
+    h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
+    h("div", { class: "row" }, h("label", { text: "Model" }), model, datalist),
+    h("span", {
+      class: "hint",
+      text: "Model ids: console.groq.com/docs/models. Images need a vision model; PDFs are not supported.",
+    }),
+    feedback,
+  );
+}
+
 // ── Integrations section ──────────────────────────────────────────────────────
 
 interface IntegrationDef {
@@ -282,6 +402,11 @@ const INTEGRATIONS: IntegrationDef[] = [
     fields: [{ key: "notion-api-key", label: "Integration token", placeholder: "ntn_…", secret: true }] },
   { id: "integration_calcom", name: "Cal.com", color: "#C9956A",
     fields: [{ key: "calcom-api-key", label: "API key", placeholder: "cal_…", secret: true }] },
+  // No key: these two run entirely on this PC.
+  { id: "integration_pomodoro", name: "Pomodoro", color: "#EF6461", fields: [] },
+  { id: "integration_media", name: "Music", color: "#1DB954", fields: [] },
+  { id: "integration_calendar", name: "Google Calendar", color: "#4285F4",
+    fields: [{ key: "gcal-ics-url", label: "Secret iCal link", placeholder: "https://calendar.google.com/calendar/ical/…/basic.ics", secret: true }] },
 ];
 
 const MAX_ACTIVE = 4;
@@ -327,6 +452,8 @@ function integrationsSection(present: Record<string, boolean>): HTMLElement {
         try {
           await Bridge.secretSet(field.key, value);
           present[field.key] = value.length > 0;
+          // Tell the island, so the calendar loads the new link right away.
+          if (field.key === "gcal-ics-url") void save();
           input.value = "";
           input.placeholder = value ? "••••••••  (stored)" : field.placeholder;
           dotEl.style.background = value ? "#22c55e" : "#f4505e";
@@ -407,6 +534,11 @@ function generalSection(): HTMLElement {
       h("span", { class: "hint", text: "seconds after you leave the island" }),
     ),
     h("div", { class: "row" },
+      h("label", { text: "Always show the island" }),
+      toggle(settings.keepVisible === true, (v) => { settings.keepVisible = v; void save(); }),
+      h("span", { class: "hint", text: "the compact island stays on screen when nothing is running" }),
+    ),
+    h("div", { class: "row" },
       h("label", { text: "Island lives on" }),
       screen,
     ),
@@ -430,10 +562,12 @@ async function main() {
   };
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
+  const hasGroqKey = (await Bridge.secretPresent("groq-api-key")) ?? false;
 
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",
     "n8n-url", "n8n-api-key", "resend-api-key", "notion-api-key", "calcom-api-key",
+    "gcal-ics-url",
   ];
   const present: Record<string, boolean> = {};
   for (const k of keys) present[k] = (await Bridge.secretPresent(k)) ?? false;
@@ -442,7 +576,9 @@ async function main() {
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
+    providerSection(),
     apiSection(hasKey),
+    groqSection(hasGroqKey),
     integrationsSection(present),
     generalSection(),
     h("div", {

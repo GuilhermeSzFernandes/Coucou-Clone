@@ -52,6 +52,8 @@ export const Bridge = {
 
   /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
   openInVSCode: (path: string | null) => call<boolean>("open_in_vscode", { path }),
+  /** "Open terminal" → new Windows Terminal tab in the folder (VS Code / Explorer as fallback). */
+  openTerminal: (path: string | null) => call<boolean>("open_terminal", { path }),
 
   quit: () => call<void>("quit_app"),
 
@@ -85,6 +87,12 @@ export const Bridge = {
   chatReset: () => call<void>("chat_reset"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
+  /** Opens the Windows "Open" dialog; null when cancelled. */
+  pickFile: () => call<string | null>("pick_file"),
+  /** Calendar pill: the iCal text behind the secret link (the link stays in Rust). */
+  calendarFetch: () => callOrThrow<string>("calendar_fetch"),
+  /** Media pill: play/pause, next, previous on whatever Windows says is playing. */
+  mediaControl: (action: "toggle" | "next" | "previous") => call<void>("media_control", { action }),
   /** Only ever tells you whether a key exists — never its value. */
   secretPresent: (key: string) => call<boolean>("secret_present", { key }),
   secretSet: (key: string, value: string) => callOrThrow<void>("secret_set", { key, value }),

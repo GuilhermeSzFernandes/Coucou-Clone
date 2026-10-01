@@ -18,7 +18,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MAX_TOKENS: u32 = 4096;
 /// Text and code files are inlined; anything larger is skipped, as on macOS.
-const MAX_INLINE_TEXT: u64 = 200_000;
+pub(crate) const MAX_INLINE_TEXT: u64 = 200_000;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
@@ -31,6 +31,9 @@ No markdown formatting (no **, no ##, no bullet dashes). Use plain text with lin
 pub struct Chat {
     /// Full multi-turn history, including tool_use / tool_result blocks.
     messages: Mutex<Vec<Value>>,
+    /// Provider the history was written for. Claude and Groq store messages in
+    /// different shapes, so switching provider starts a fresh conversation.
+    provider: Mutex<String>,
 }
 
 impl Chat {
@@ -38,19 +41,28 @@ impl Chat {
         self.messages.lock().unwrap().clear();
     }
 
-    fn is_empty(&self) -> bool {
+    /// Clears the history when it belongs to another provider.
+    pub(crate) fn use_provider(&self, provider: &str) {
+        let mut current = self.provider.lock().unwrap();
+        if *current != provider {
+            self.messages.lock().unwrap().clear();
+            *current = provider.to_string();
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.messages.lock().unwrap().is_empty()
     }
 
-    fn push(&self, message: Value) {
+    pub(crate) fn push(&self, message: Value) {
         self.messages.lock().unwrap().push(message);
     }
 
-    fn pop(&self) {
+    pub(crate) fn pop(&self) {
         self.messages.lock().unwrap().pop();
     }
 
-    fn snapshot(&self) -> Vec<Value> {
+    pub(crate) fn snapshot(&self) -> Vec<Value> {
         self.messages.lock().unwrap().clone()
     }
 }

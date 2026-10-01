@@ -22,13 +22,20 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 keyring = { version = "3", features = ["windows-native"] }
+# Where IAsyncOperation lives since windows 0.61 (already pulled in by `windows`).
+windows-future = "0.2"
 windows = { version = "0.61", features = [
+  "Foundation",
+  "Media_Control",
+  "Storage_Streams",
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_System_Com",
   "Win32_System_Ole",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }

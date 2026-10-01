@@ -67,6 +67,41 @@ pub fn ingest(source: &str) -> Result<DroppedFile, String> {
     })
 }
 
+/// Opens the standard Windows "Open" dialog and returns the chosen file, or
+/// None when the user cancels. The alternative to dragging a file onto the
+/// island, for machines where the drag never reaches the app. Blocking: run it
+/// on its own thread.
+pub fn pick() -> Option<String> {
+    use windows::core::{w, PWSTR};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+        OPENFILENAMEW,
+    };
+
+    let mut buf = vec![0u16; 4096];
+    // The Explorer-style dialog hosts shell COM objects; give the thread an STA.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: w!("Attach a file"),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) }.as_bool();
+    if com.is_ok() {
+        unsafe { CoUninitialize() };
+    }
+    if !ok {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let path = String::from_utf16_lossy(&buf[..len]);
+    (!path.is_empty()).then_some(path)
+}
+
 /// Drops anything copied here more than a week ago. `ingest` stamps every copy
 /// with the time it landed, so this really is the age of the copy and not the
 /// age of whatever the user happened to drag in.

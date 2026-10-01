@@ -20,6 +20,23 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Which AI answers the chat: "anthropic" (Claude) or "groq".
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Model used when the provider is Groq.
+    #[serde(default = "default_groq_model")]
+    pub groq_model: String,
+    /// Never fold the compact island away, even with nothing running.
+    #[serde(default)]
+    pub keep_visible: bool,
+}
+
+fn default_provider() -> String {
+    "anthropic".to_string()
+}
+
+fn default_groq_model() -> String {
+    crate::groq::DEFAULT_MODEL.to_string()
 }
 
 fn default_model() -> String {
@@ -43,6 +60,9 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            provider: default_provider(),
+            groq_model: default_groq_model(),
+            keep_visible: false,
         }
     }
 }

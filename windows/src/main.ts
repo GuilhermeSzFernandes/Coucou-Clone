@@ -7,6 +7,8 @@ import { State, type Settings } from "./core/state";
 import { Island } from "./island/island";
 import { registerHookHandlers } from "./island/hooks";
 import { registerIntegrationHandlers, refreshConfigured } from "./island/integrations";
+import { initPomodoro } from "./island/pomodoro";
+import { CalendarStore, initCalendar } from "./island/calendar";
 
 async function main() {
   const root = document.getElementById("root");
@@ -42,6 +44,12 @@ async function main() {
         setPaused(false);
         island.alert(State.defaultView());
         break;
+      case "ask":
+        // Ctrl+Alt+Space: straight into the chat, keyboard ready.
+        setPaused(false);
+        island.alert("prompt");
+        void Bridge.focusWindow(true);
+        break;
       case "pause":
         setPaused(!State.paused);
         if (State.paused) island.fsm.forceHidden();
@@ -58,10 +66,13 @@ async function main() {
     island.applySettings();
     State.loadIntegrationTasks();
     void refreshConfigured();
+    void CalendarStore.refresh(); // pill just switched on, or the link changed
   });
 
   registerHookHandlers(island);
   registerIntegrationHandlers(island);
+  initPomodoro(island);
+  initCalendar();
 
   island.launch();
 
