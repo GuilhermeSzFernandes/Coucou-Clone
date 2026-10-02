@@ -41,7 +41,7 @@ pub struct IntegrationEvent {
     pub detail: Option<String>,
 }
 
-fn emit(app: &AppHandle, update: IntegrationUpdate) {
+pub(crate) fn emit(app: &AppHandle, update: IntegrationUpdate) {
     let _ = app.emit_to(WINDOW_LABEL, "integration", update);
 }
 
@@ -72,7 +72,7 @@ pub fn start(app: AppHandle) {
 }
 
 /// True when the user has this integration switched on in settings.
-fn enabled(app: &AppHandle, id: &str) -> bool {
+pub(crate) fn enabled(app: &AppHandle, id: &str) -> bool {
     app.try_state::<crate::Shared>()
         .map(|shared| {
             let settings = shared.settings.lock().unwrap();
@@ -285,42 +285,37 @@ async fn poll_github(app: AppHandle) {
         });
         return;
     }
-    let json: Value = response.json().await.unwrap_or(json!({}));
-    let public = json.get("public_repos").and_then(Value::as_i64).unwrap_or(0);
-    let private = json
-        .get("owned_private_repos")
-        .or_else(|| json.get("total_private_repos"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    // Pull requests you authored, across every repository the token can see.
+    // Closed includes merged. Null when the search fails (rate limit, scope),
+    // so the card shows a dash instead of a misleading zero.
+    let prs_open = search_count(&http, &token, "is:pr author:@me is:open").await;
+    let prs_closed = search_count(&http, &token, "is:pr author:@me is:closed").await;
 
-    let repos = http
-        .get("https://api.github.com/user/repos?per_page=100&affiliation=owner&sort=pushed")
+    emit(&app, IntegrationUpdate {
+        id: "integration_github",
+        data: json!({ "prsOpen": prs_open, "prsClosed": prs_closed }),
+        error: None,
+        event: None,
+    });
+}
+
+/// `total_count` of a GitHub issue search; only one result is fetched.
+async fn search_count(http: &reqwest::Client, token: &str, query: &str) -> Option<i64> {
+    let response = http
+        .get("https://api.github.com/search/issues")
+        .query(&[("q", query), ("per_page", "1")])
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "Coucou")
         .send()
-        .await;
-    let stars: i64 = match repos {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .map(|list| {
-                list.iter()
-                    .filter_map(|r| r.get("stargazers_count").and_then(Value::as_i64))
-                    .sum()
-            })
-            .unwrap_or(0),
-        _ => 0,
-    };
-
-    emit(&app, IntegrationUpdate {
-        id: "integration_github",
-        data: json!({ "totalRepos": public + private, "totalStars": stars }),
-        error: None,
-        event: None,
-    });
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        crate::log::line(format!("github search HTTP {}", response.status()));
+        return None;
+    }
+    let json: Value = response.json().await.ok()?;
+    json.get("total_count").and_then(Value::as_i64)
 }
 
 // ── Vercel ────────────────────────────────────────────────────────────────────

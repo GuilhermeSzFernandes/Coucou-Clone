@@ -11,6 +11,9 @@ import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
 import { buildChoose, buildUpload, buildUploading } from "./upload";
 import { renderIntegrationCard, type IntegrationCardHooks } from "./integrations";
+import { buildCalendarView } from "./calendar";
+import { buildCaptureView } from "./capture";
+import { buildTodayView } from "./today";
 
 export interface ViewActions {
   setView(v: IslandViewName): void;
@@ -26,6 +29,10 @@ export interface ViewActions {
   setAutoClose(seconds: number): void;
   openSettingsWindow(): void;
   blip(): void;
+  /** "+" view: choose a file with the Windows dialog instead of dragging it. */
+  pickFile(): void;
+  /** Claude card: show another terminal tab's session. */
+  selectSession(id: string): void;
 }
 
 export interface ViewHost {
@@ -35,6 +42,8 @@ export interface ViewHost {
   focus?(): void;
   /** Called every frame while the view is on screen. */
   tick?(nowMs: number): void;
+  /** True while the view has an animation of its own in flight (keeps the frame loop alive). */
+  readonly animating?: boolean;
 }
 
 // ── Shared pieces ─────────────────────────────────────────────────────────────
@@ -80,7 +89,9 @@ function stack(padLeft: number, padRight: number, ...children: Node[]): HTMLElem
 export function buildHeader(actions: ViewActions): ViewHost {
   const tabHome = h("button", { class: "tab", title: "Overview", onclick: () => go("overview") }, svg(ICONS.house, 13));
   const tabChat = h("button", { class: "tab", title: "Ask", onclick: () => go("prompt") }, svg(ICONS.bubble, 13));
-  const tabDrop = h("button", { class: "tab", title: "Drop", onclick: () => go("upload") }, svg(ICONS.plus, 13));
+  const tabCal = h("button", { class: "tab", title: "Calendar", onclick: () => go("calendar") }, svg(ICONS.calendar, 13));
+  const tabNote = h("button", { class: "tab", title: "Anotar (Ctrl+Alt+N)", onclick: () => go("capture") }, svg(ICONS.notebook, 13));
+  const tabToday = h("button", { class: "tab", title: "Meu dia", onclick: () => go("today") }, svg(ICONS.checklist, 13));
 
   const gearBtn = h("button", { title: "Settings", onclick: () => go("settings") }, svg(ICONS.gear, 14));
   const soundBtn = h("button", { title: "Mute", onclick: () => actions.toggleSound() }, svg(ICONS.speakerOn, 14));
@@ -93,7 +104,9 @@ export function buildHeader(actions: ViewActions): ViewHost {
   const el = h(
     "div",
     { id: "header" },
-    h("div", { class: "tabs" }, tabHome, tabChat, tabDrop),
+    // No "+" tab: files are attached from the chat (📎 or Ctrl+V). Dragging a
+    // file onto the island still opens the drop view on its own.
+    h("div", { class: "tabs" }, tabHome, tabChat, tabNote, tabToday, tabCal),
     h("div", { class: "header-actions" }, gearBtn, soundBtn),
   );
 
@@ -103,7 +116,11 @@ export function buildHeader(actions: ViewActions): ViewHost {
       const v = State.view;
       tabHome.classList.toggle("on", v === "overview" || v === "empty");
       tabChat.classList.toggle("on", v === "prompt");
-      tabDrop.classList.toggle("on", v === "upload");
+      tabCal.classList.toggle("on", v === "calendar");
+      tabNote.classList.toggle("on", v === "capture");
+      tabToday.classList.toggle("on", v === "today");
+      // The tab only makes sense with the calendar pill switched on.
+      tabCal.style.display = State.settings.activeIntegrations.includes("integration_calendar") ? "" : "none";
       gearBtn.classList.toggle("on", v === "settings");
       clear(gearBtn);
       gearBtn.append(svg(v === "settings" ? ICONS.gearFill : ICONS.gear, 14));
@@ -118,6 +135,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
 
 function buildOverview(actions: ViewActions): ViewHost {
   const ticker = new Ticker();
+  let lastSession: string | null = null;
   const who = h("div", { class: "who" });
   const tickerBody = h("div", { class: "card-body" }, who, ticker.el);
   const leftBody = h("div", { class: "left-body" });
@@ -142,6 +160,9 @@ function buildOverview(actions: ViewActions): ViewHost {
   let cardKey = "";
 
   const hooks: IntegrationCardHooks = {
+    openCalendar() {
+      actions.setView("calendar");
+    },
     get detailOpen() {
       return detailOpen;
     },
@@ -160,6 +181,9 @@ function buildOverview(actions: ViewActions): ViewHost {
 
   return {
     el,
+    get animating() {
+      return mode === "ticker" && ticker.animating;
+    },
     tick(nowMs: number) {
       if (mode === "ticker") ticker.tick(nowMs);
     },
@@ -184,12 +208,38 @@ function buildOverview(actions: ViewActions): ViewHost {
           mode = "ticker";
           cardKey = "";
         }
+        // A different tab's session: its steps replace the ticker, no scroll.
+        if (State.selectedSessionId !== lastSession) {
+          lastSession = State.selectedSessionId;
+          ticker.reset();
+        }
         clear(who);
-        who.append(
-          dot(task.color, 7),
-          h("span", { class: "name", text: task.name }),
-          h("span", { class: "tool", text: task.source === "claudeCode" ? "Claude Code" : "n8n" }),
-        );
+        const sessions = State.claudeSessions;
+        if (task.id === "integration_claude" && sessions.length > 1) {
+          // One chip per terminal tab; the dot is that tab's state.
+          for (const s of sessions.slice(0, 4)) {
+            const chip = h(
+              "button",
+              {
+                class: s.id === State.selectedSessionId ? "sess-chip on" : "sess-chip",
+                title: `${s.project} — ${s.state}`,
+              },
+              h("i", { class: `sess-dot ${s.state}` }),
+              h("span", { text: s.project }),
+            );
+            chip.addEventListener("click", (e) => {
+              e.stopPropagation();
+              actions.selectSession(s.id);
+            });
+            who.append(chip);
+          }
+        } else {
+          who.append(
+            dot(task.color, 7),
+            h("span", { class: "name", text: task.name }),
+            h("span", { class: "tool", text: task.source === "claudeCode" ? "Claude Code" : "n8n" }),
+          );
+        }
         if (task.steps.length > 1) {
           who.append(h("span", {
             class: "count",
@@ -227,7 +277,7 @@ function buildOverview(actions: ViewActions): ViewHost {
 }
 
 function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
-  const label = task.id === "integration_claude" ? "VS Code" : task.name;
+  const label = task.id === "integration_claude" ? "Claude Code" : task.name;
   const canvas = createMiniBot(task, 24);
   const pill = h(
     "div",
@@ -299,6 +349,10 @@ function buildApproval(actions: ViewActions): ViewHost {
     sync() {
       clear(who);
       who.append(agentWho(State.focusTask, "needs permission"));
+      const waiting = State.approvalQueue.length;
+      if (waiting > 0) {
+        who.append(h("span", { class: "queue-note", text: `+${waiting} waiting in other tabs` }));
+      }
       // The whole point of approving here rather than in the terminal: this line
       // is the command, the file path or the URL being authorised, not just the
       // name of the tool asking.
@@ -497,8 +551,11 @@ export function buildViews(
   map.set("confused", buildConfused());
   map.set("note", buildNote());
   map.set("settings", buildSettings(actions));
+  map.set("calendar", buildCalendarView(actions));
+  map.set("capture", buildCaptureView(actions));
+  map.set("today", buildTodayView(actions));
   map.set("prompt", buildPrompt(onChatHeightChange));
-  map.set("upload", buildUpload());
+  map.set("upload", buildUpload(actions));
   map.set("uploading", buildUploading());
   map.set("choose", buildChoose(actions));
   // Not in the Windows v1: sending a file by email, window attach + web result.

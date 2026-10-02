@@ -27,9 +27,9 @@ function dashedFrame(): SVGSVGElement {
   return el;
 }
 
-export function buildUpload(): ViewHost {
+export function buildUpload(actions: ViewActions): ViewHost {
   const frame = dashedFrame();
-  const title = h("div", { class: "drop-title", text: "Drop your files here" });
+  const title = h("div", { class: "drop-title", text: "Drop a file here, or click to choose one" });
   const tags = h(
     "div",
     { class: "drop-tags" },
@@ -41,6 +41,9 @@ export function buildUpload(): ViewHost {
     frame,
     h("div", { class: "drop-body" }, title, tags),
   );
+  // Where dragging from Explorer does not reach the app, a click does the same.
+  card.classList.add("clickable");
+  card.addEventListener("click", () => actions.pickFile());
   const el = h("div", { class: "view" }, card);
 
   return {

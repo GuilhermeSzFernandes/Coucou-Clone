@@ -18,6 +18,10 @@ export class IslandStateMachine {
   greetHoverCollapseDelay = 10;
   /** An alert waiting for an answer stays open, even when the mouse leaves. */
   pinned = false;
+  /** Settings → "Always show the island": the compact island never hides. */
+  keepVisible = false;
+  /** A running Pomodoro keeps the compact island (and its timer) on screen. */
+  timerHold = false;
 
   private petitHide: number | null = null;
   private homeCollapse: number | null = null;
@@ -106,6 +110,7 @@ export class IslandStateMachine {
 
   private schedulePetitHide() {
     this.clear("petitHide");
+    if (this.keepVisible || this.timerHold) return;
     this.petitHide = window.setTimeout(() => {
       this.petitHide = null;
       if (this.state === "petit") this.transition("hidden");

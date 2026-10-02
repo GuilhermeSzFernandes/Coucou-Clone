@@ -141,6 +141,23 @@ pub fn unblock_webview_drops(app: &AppHandle) {
     }
 }
 
+/// Keeps the webview's own drop target out of the way at all times.
+///
+/// `unblock_webview_drops` used to run only from the cursor poll, on a mouse
+/// press — and the poll is parked while the island is hidden. A drag that starts
+/// in Explorer while the island is folded away therefore met WebView2's target,
+/// which refuses everything (the "no drop" cursor), and the island never woke up.
+/// Re-running it every couple of seconds is a handful of window-class lookups:
+/// cheap enough to ignore, and it also catches WebView2 recreating its window.
+pub fn spawn_drop_guard(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        let handle = app.clone();
+        // RevokeDragDrop must run on the thread that registered the target.
+        let _ = app.run_on_main_thread(move || unblock_webview_drops(&handle));
+        std::thread::sleep(Duration::from_secs(2));
+    });
+}
+
 unsafe extern "system" fn revoke_render_widget(hwnd: HWND, _: LPARAM) -> BOOL {
     let mut name = [0u16; 64];
     let len = unsafe { GetClassNameW(hwnd, &mut name) };

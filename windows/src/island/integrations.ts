@@ -5,6 +5,7 @@
 import { onEvent, Bridge, type IntegrationUpdate } from "../core/bridge";
 import { Sound } from "../core/sound";
 import { State } from "../core/state";
+import { setMediaArt } from "../views/integrations";
 import type { Island } from "./island";
 
 /** Which Credential Manager key backs each pill. */
@@ -16,6 +17,7 @@ const KEY_FOR: Record<string, string> = {
   integration_resend: "resend-api-key",
   integration_notion: "notion-api-key",
   integration_calcom: "calcom-api-key",
+  integration_calendar: "gcal-ics-url",
 };
 
 const clearTimers = new Map<string, number>();
@@ -42,6 +44,30 @@ export async function refreshConfigured() {
 
 function handle(island: Island, update: IntegrationUpdate) {
   if (State.paused) return;
+
+  // Music: play/pause, next or previous (media keys, the player, or the card)
+  // shows the music card for five seconds. Not on the very first update.
+  if (update.id === "integration_media" && update.data) {
+    const before = State.integrations[update.id]?.data as Record<string, unknown> | undefined;
+    const after = update.data as Record<string, unknown>;
+    const changed =
+      before !== undefined &&
+      after.active === true &&
+      (before.active !== true ||
+        before.playing !== after.playing ||
+        before.title !== after.title ||
+        before.artist !== after.artist);
+    if (changed) queueMicrotask(() => island.flashPill("integration_media", 5000));
+  }
+
+  // The cover art is big and only sent when the track changes: park it aside
+  // so it is not re-serialised on every render.
+  if (update.id === "integration_media" && update.data && "art" in update.data) {
+    const data = { ...(update.data as Record<string, unknown>) };
+    setMediaArt(typeof data.art === "string" ? data.art : null);
+    delete data.art;
+    update = { ...update, data };
+  }
 
   const previous = State.integrations[update.id];
   State.integrations[update.id] = {

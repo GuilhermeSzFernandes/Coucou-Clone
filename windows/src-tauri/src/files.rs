@@ -67,6 +67,115 @@ pub fn ingest(source: &str) -> Result<DroppedFile, String> {
     })
 }
 
+/// Biggest pasted image accepted (a 4K screenshot is a few MB).
+const MAX_PASTE: usize = 15 * 1024 * 1024;
+
+/// A screenshot pasted into the chat (Ctrl+V): saved into the inbox like a
+/// dropped file, so the chat treats both the same way.
+pub fn save_pasted(data_base64: &str, ext: &str) -> Result<DroppedFile, String> {
+    let ext = match ext.to_lowercase().as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpg",
+        "gif" => "gif",
+        "webp" => "webp",
+        _ => return Err("Only images can be pasted.".into()),
+    };
+    let bytes = base64_decode(data_base64).ok_or("The pasted image could not be read.")?;
+    if bytes.is_empty() || bytes.len() > MAX_PASTE {
+        return Err("The pasted image is too large.".into());
+    }
+
+    let dir = inbox_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("print-{stamp}.{ext}");
+    let dest = dir.join(&name);
+    std::fs::write(&dest, &bytes).map_err(|e| format!("cannot save: {e}"))?;
+    sweep(&dir);
+
+    Ok(DroppedFile {
+        name,
+        path: dest.to_string_lossy().to_string(),
+        size: bytes.len() as u64,
+    })
+}
+
+/// Standard base64 (RFC 4648), whitespace tolerated. None on bad input.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = input.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    if clean.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            let v = if i >= 4 - pad { 0 } else { val(c)? };
+            n = (n << 6) | v;
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Opens the standard Windows "Open" dialog and returns the chosen file, or
+/// None when the user cancels. The alternative to dragging a file onto the
+/// island, for machines where the drag never reaches the app. Blocking: run it
+/// on its own thread.
+pub fn pick() -> Option<String> {
+    use windows::core::{w, PWSTR};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+        OPENFILENAMEW,
+    };
+
+    let mut buf = vec![0u16; 4096];
+    // The Explorer-style dialog hosts shell COM objects; give the thread an STA.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: w!("Attach a file"),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) }.as_bool();
+    if com.is_ok() {
+        unsafe { CoUninitialize() };
+    }
+    if !ok {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let path = String::from_utf16_lossy(&buf[..len]);
+    (!path.is_empty()).then_some(path)
+}
+
 /// Drops anything copied here more than a week ago. `ingest` stamps every copy
 /// with the time it landed, so this really is the age of the copy and not the
 /// age of whatever the user happened to drag in.
@@ -85,6 +194,17 @@ fn sweep(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_decode_round_trips() {
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
+        assert!(base64_decode("Zm9").is_none());
+        assert!(base64_decode("Zm9!").is_none());
+    }
 
     #[test]
     fn ingest_copies_and_never_overwrites() {

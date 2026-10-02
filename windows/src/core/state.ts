@@ -26,12 +26,26 @@ export interface ApprovalInfo {
   sessionId: string;
   tool: string;
   command: string;
+  /** Project of the session asking (one terminal tab = one session). */
+  project?: string;
+}
+
+/** One Claude Code session — one terminal tab. */
+export interface ClaudeSession {
+  id: string;
+  project: string;
+  cwd: string;
+  steps: string[];
+  state: BotStateName;
+  updatedAt: number;
 }
 
 export interface ChatMessage {
   id: number;
   role: "user" | "assistant";
   content: string;
+  /** Second-brain notes the answer was given. */
+  sources?: { title: string; path: string }[];
 }
 
 export type PromptContext =
@@ -58,7 +72,7 @@ const task = (
 
 /** AgentTask.integrationAgents — same ids, names and colours as macOS. */
 export const INTEGRATION_AGENTS: AgentTask[] = [
-  task("integration_claude", "VS Code", "#F5F6F8", "claudeCode"),
+  task("integration_claude", "Claude Code", "#F5F6F8", "claudeCode"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -66,11 +80,15 @@ export const INTEGRATION_AGENTS: AgentTask[] = [
   task("integration_notion", "Notion", "#8C8C8C", "n8n"),
   task("integration_calcom", "Cal.com", "#C9956A", "n8n"),
   task("integration_stripe", "Stripe", "#0570DE", "n8n"),
+  task("integration_pomodoro", "Pomodoro", "#EF6461", "n8n"),
+  task("integration_media", "Music", "#1DB954", "n8n"),
+  task("integration_calendar", "Calendar", "#4285F4", "n8n"),
 ];
 
 export const TOGGLEABLE_INTEGRATION_IDS = [
   "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
   "integration_notion", "integration_calcom", "integration_stripe",
+  "integration_pomodoro", "integration_media", "integration_calendar",
 ];
 
 /** What an integration poller last reported. */
@@ -80,6 +98,20 @@ export interface IntegrationInfo {
   loaded: boolean;
   configured: boolean;
 }
+
+/** One calendar of the calendar pill (its link is in the Credential Manager). */
+export interface CalendarSource {
+  slot: number;
+  name: string;
+  color: string;
+  /** Bumped when the link changes, so the island reloads it. */
+  rev: number;
+}
+
+export const DEFAULT_CALENDARS: CalendarSource[] = [
+  { slot: 1, name: "Main", color: "#4285F4", rev: 0 },
+  { slot: 2, name: "Birthdays", color: "#22C55E", rev: 0 },
+];
 
 export interface Settings {
   soundEnabled: boolean;
@@ -92,6 +124,21 @@ export interface Settings {
   hooksInstalled: boolean;
   /** Claude model used by the chat. */
   model: string;
+  /** Which AI answers the chat. */
+  provider: "anthropic" | "groq";
+  /** Model used when the provider is Groq. */
+  groqModel: string;
+  /** Never fold the compact island away, even with nothing running. */
+  keepVisible: boolean;
+  calendars: CalendarSource[];
+  /** Second brain: Obsidian vault folder ("" = not set up). */
+  notesVault: string;
+  /** A note with a date: "ask" = button, "auto" = open Google Calendar. */
+  reminderMode: "ask" | "auto";
+  /** The chat reads the vault before answering. */
+  brainChat: boolean;
+  /** Once a day, in the morning, "Meu dia" opens by itself for a few seconds. */
+  morningSummary: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -106,6 +153,14 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  provider: "anthropic",
+  groqModel: "openai/gpt-oss-120b",
+  keepVisible: false,
+  calendars: DEFAULT_CALENDARS.map((c) => ({ ...c })),
+  notesVault: "",
+  reminderMode: "ask",
+  brainChat: true,
+  morningSummary: true,
 };
 
 type Listener = () => void;
@@ -132,11 +187,20 @@ class AppState {
   fileDragOver = false;
 
   promptContext: PromptContext | null = null;
-  droppedFile: { name: string; path: string } | null = null;
+  /** `preview`: a thumbnail (object URL) for pasted screenshots. */
+  droppedFile: { name: string; path: string; preview?: string } | null = null;
   noteMessage: string | null = null;
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
+  /** Approvals waiting behind the one on screen (other tabs asking at once). */
+  approvalQueue: ApprovalInfo[] = [];
+  /** Live Claude Code sessions, one per terminal tab. */
+  claudeSessions: ClaudeSession[] = [];
+  /** The session the Claude card shows; null = follow the latest one. */
+  selectedSessionId: string | null = null;
+  /** When the user last picked a session by hand (the card stops following). */
+  sessionPickedAt = 0;
 
   integrations: Record<string, IntegrationInfo> = {};
 

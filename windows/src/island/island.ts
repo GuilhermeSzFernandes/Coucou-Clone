@@ -16,6 +16,7 @@ import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
 import { UploadCanvas } from "../upload/canvas";
 import { USC, UploadSeq } from "../upload/sequence";
+import { approvalDecided, selectSession, showNextApproval } from "./hooks";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
 import { h } from "../views/dom";
 import { IslandStateMachine } from "./fsm";
@@ -44,6 +45,8 @@ export class Island {
   private botGlow!: HTMLElement;
   private greetingCanvas!: HTMLCanvasElement;
   private miniGrid!: HTMLElement;
+  /** Pomodoro countdown shown in the middle of the compact island. */
+  private compactTimer!: HTMLElement;
   private countdown!: HTMLElement;
   private wakeStrip!: HTMLElement;
 
@@ -83,6 +86,7 @@ export class Island {
   private confusedRecovery: number | null = null;
   private prevViewBeforeConfused: IslandViewName = "overview";
   private lastSyncedView: IslandViewName | null = null;
+  private lastWasCapture = false;
 
   /** Drop sequence bookkeeping: last tick played, and whether the ✓ has fired. */
   private uploadTens = 0;
@@ -99,6 +103,11 @@ export class Island {
       this.dirty = true;
       this.ensureRunning();
     });
+    // Quick Ask stays open until keyboard focus leaves the island — unless the
+    // file dialog of the 📎 button is what took it (State.isPinned meanwhile).
+    window.addEventListener("blur", () => {
+      if (!State.isPinned) this.releaseAsk();
+    });
   }
 
   // ── DOM ─────────────────────────────────────────────────────────────────────
@@ -113,7 +122,7 @@ export class Island {
       },
       openTerminal: () => {
         const cwd = State.focusTask?.sessionCwd ?? null;
-        void Bridge.openInVSCode(cwd);
+        void Bridge.openTerminal(cwd);
       },
       // The ↗ button — same targets as openAgentTarget() on macOS.
       openTarget: () => {
@@ -126,8 +135,9 @@ export class Island {
           integration_stripe: "https://dashboard.stripe.com/payments",
           integration_notion: "https://notion.so",
           integration_calcom: "https://app.cal.com/bookings",
+          integration_calendar: "https://calendar.google.com",
         };
-        if (task.id === "integration_claude") void Bridge.openInVSCode(task.sessionCwd ?? null);
+        if (task.id === "integration_claude") void Bridge.openTerminal(task.sessionCwd ?? null);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
       },
@@ -141,9 +151,14 @@ export class Island {
         Sound.play(d === "deny" ? "blip" : "approve");
         void Bridge.approvalDecision(req.requestId, d);
         State.pendingApproval = null;
+        approvalDecided(req);
+        // Another tab was waiting: its card comes up next.
+        if (showNextApproval(this)) {
+          State.notify();
+          return;
+        }
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
         State.setPillBadge("integration_claude", null);
         this.setView(State.defaultView());
       },
@@ -166,6 +181,8 @@ export class Island {
         State.notify();
       },
       openSettingsWindow: () => void Bridge.openSettingsWindow(),
+      pickFile: () => void this.pickAndSwallow(),
+      selectSession: (id) => selectSession(id),
       blip: () => Sound.play("blip"),
     };
 
@@ -174,6 +191,7 @@ export class Island {
     this.botCanvas = h("canvas", { id: "bot-canvas" });
     this.greetingCanvas = h("canvas", { id: "greeting-canvas" });
     this.miniGrid = h("div", { id: "mini-grid" });
+    this.compactTimer = h("div", { id: "compact-timer" });
     this.countdown = h("div", { id: "countdown" });
 
     this.header = buildHeader(actions);
@@ -208,6 +226,7 @@ export class Island {
       this.botGlow,
       this.botCanvas,
       this.miniGrid,
+      this.compactTimer,
       this.countdown,
     );
 
@@ -299,6 +318,16 @@ export class Island {
   }
 
   setView(view: IslandViewName) {
+    if (view !== "prompt" && view !== "searching" && view !== "result" && view !== "capture") this.releaseAsk();
+    // A Claude Code approval that arrived during a chat waited behind it; the
+    // moment the chat is left for anything else, it is what shows.
+    const ai = (v: IslandViewName) => v === "prompt" || v === "searching" || v === "result" || v === "capture";
+    if (ai(State.view) && !ai(view) && State.pendingApproval) {
+      State.setFocus("integration_claude");
+      State.isPinned = true;
+      this.fsm.pinned = true;
+      view = "approval";
+    }
     this.stopSequenceIfLeaving(view);
     if (State.mode !== "expanded") {
       this.fsm.forceHome();
@@ -332,6 +361,86 @@ export class Island {
 
   reveal() {
     this.fsm.reveal();
+  }
+
+  // ── Quick Ask (Ctrl+Alt+Space) ──────────────────────────────────────────────
+
+  /**
+   * Opened from the keyboard, the mouse is not over the island, so the usual
+   * "close after a few seconds away" would fold the chat while you type. Instead
+   * it stays until the island loses keyboard focus (you clicked elsewhere) or
+   * the chat is left.
+   */
+  private askPinned = false;
+
+  openAsk(view: "prompt" | "capture" = "prompt") {
+    this.alert(view);
+    this.askPinned = true;
+    this.fsm.pinned = true;
+    // Opening already queued the auto-close (the mouse is elsewhere): drop it.
+    this.fsm.cancelTimers();
+    this.homeCollapseAt = null;
+    void Bridge.focusWindow(true);
+  }
+
+  private releaseAsk() {
+    if (!this.askPinned) return;
+    this.askPinned = false;
+    this.fsm.pinned = State.isPinned;
+    if (!this.wasInIsland) this.fsm.mouseLeft(); // the normal countdown resumes
+  }
+
+  // ── Flash a view for a few seconds (morning summary) ────────────────────────
+
+  flashView(view: IslandViewName, ms: number) {
+    if (State.paused || this.askPinned || State.isPinned || State.pendingApproval) return;
+    if (State.mode === "expanded" && this.wasInIsland) return; // in use right now
+    this.alert(view);
+    this.fsm.pinned = true;
+    this.fsm.cancelTimers();
+    this.homeCollapseAt = null;
+    window.setTimeout(() => {
+      this.fsm.pinned = State.isPinned;
+      if (State.pendingApproval || this.askPinned || this.wasInIsland) return;
+      if (State.mode === "expanded" && State.view === view) this.collapse();
+    }, ms);
+  }
+
+  // ── Now playing flash ───────────────────────────────────────────────────────
+
+  private flashTimer: number | null = null;
+  private flashFrom: string | null = null;
+
+  /**
+   * Shows one pill's card for a few seconds (music changed), then folds back
+   * and returns to the pill that was in focus. Never interrupts the chat, an
+   * answer Claude Code is waiting for, or someone using the island right now.
+   */
+  flashPill(id: string, ms: number) {
+    if (State.paused || this.askPinned || State.isPinned || State.pendingApproval) return;
+    if (State.mode === "expanded" && (this.wasInIsland || State.view !== "overview")) {
+      // Already open and in use (or on another screen): just point at the pill
+      // when the overview is what is showing.
+      if (State.view === "overview" && !this.wasInIsland) State.setFocus(id);
+      return;
+    }
+    if (this.flashTimer == null) this.flashFrom = State.focusId;
+    State.setFocus(id);
+    this.alert("overview");
+    this.fsm.pinned = true; // our own timer decides when it closes
+    this.fsm.cancelTimers(); // …not the auto-close that opening just queued
+    this.homeCollapseAt = null;
+    if (this.flashTimer != null) window.clearTimeout(this.flashTimer);
+    this.flashTimer = window.setTimeout(() => {
+      this.flashTimer = null;
+      this.fsm.pinned = State.isPinned;
+      const from = this.flashFrom;
+      this.flashFrom = null;
+      if (State.pendingApproval || this.askPinned) return; // something more important took over
+      if (this.wasInIsland) return; // the mouse came in: normal rules from here
+      if (from && from !== id && State.focusId === id) State.setFocus(from);
+      if (State.mode === "expanded" && State.view === "overview") this.collapse();
+    }, ms);
   }
 
   /** An alert stopped waiting for an answer: let the island auto-close again. */
@@ -377,6 +486,39 @@ export class Island {
         break;
       }
     }
+  }
+
+  /**
+   * "+" view, clicked: the Windows Open dialog, then exactly what a real drop
+   * does — Mochi steps into the zone and gulps the file down.
+   */
+  private picking = false;
+  async pickAndSwallow() {
+    if (State.paused || this.picking) return;
+    this.picking = true;
+    // The dialog takes the focus: keep the island open meanwhile.
+    State.isPinned = true;
+    this.fsm.pinned = true;
+    let path: string | null = null;
+    try {
+      path = await Bridge.pickFile();
+    } finally {
+      this.picking = false;
+      State.isPinned = false;
+      this.fsm.pinned = false;
+    }
+    if (!path) return;
+    if (State.view !== "upload") this.setView("upload");
+    State.fileDragOver = true;
+    this.engine.animateMorph(1);
+    UploadSeq.enterZone(State.mouseInIsland.x, State.mouseInIsland.y);
+    this.ensureRunning();
+    State.notify();
+    const chosen = path;
+    window.setTimeout(() => {
+      State.fileDragOver = false;
+      this.swallow(chosen);
+    }, 420);
   }
 
   /**
@@ -481,6 +623,8 @@ export class Island {
     // the state-driven DOM sync.
     this.miniGrid.style.left = `${w - 40 - 14.5}px`;
     this.miniGrid.style.top = `${hh / 2 - 14.5}px`;
+    this.compactTimer.style.left = `${w / 2}px`;
+    this.compactTimer.style.top = `${hh / 2}px`;
     this.greetingCanvas.style.left = `${(w - EXPANDED_W) / 2}px`;
     this.uploadCanvas.el.style.left = `${(w - EXPANDED_W) / 2}px`;
 
@@ -722,7 +866,9 @@ export class Island {
       ? settling
       : settling ||
         !this.botCx.settled || !this.botCy.settled || !this.botSize.settled ||
-        greetingActive || this.engine.busy || UploadSeq.isActive;
+        greetingActive || this.engine.busy || UploadSeq.isActive ||
+        // The step ticker must finish its scroll, or two rows freeze on one line.
+        this.views.get(State.view)?.animating === true;
 
     if (busy) {
       requestAnimationFrame(this.frame);
@@ -840,11 +986,13 @@ export class Island {
     // island is allowed to take keyboard focus.
     if (this.lastSyncedView !== State.view) {
       const wasChat = this.lastSyncedView === "prompt";
+      this.lastWasCapture = this.lastSyncedView === "capture";
       this.lastSyncedView = State.view;
-      if (State.view === "prompt") {
+      if (State.view === "prompt" || State.view === "capture") {
+        const v = State.view;
         void Bridge.focusWindow(true);
-        window.setTimeout(() => this.views.get("prompt")?.focus?.(), 120);
-      } else if (wasChat) {
+        window.setTimeout(() => this.views.get(v)?.focus?.(), 120);
+      } else if (wasChat || this.lastWasCapture) {
         void Bridge.focusWindow(false);
       }
     }
@@ -865,6 +1013,22 @@ export class Island {
       }
     }
 
+    // Pomodoro in the compact island: while it runs, or paused part-way.
+    const pomo = State.integrations.integration_pomodoro?.data as
+      | { running?: boolean; remaining?: number; total?: number; phase?: string }
+      | undefined;
+    const pomoOn = State.settings.activeIntegrations.includes("integration_pomodoro");
+    const started = !!pomo && (pomo.running === true || Number(pomo.remaining) < Number(pomo.total));
+    const showTimer = State.mode === "compact" && pomoOn && started;
+    this.compactTimer.style.opacity = showTimer ? "1" : "0";
+    if (showTimer && pomo) {
+      const s = Math.max(0, Math.round(Number(pomo.remaining ?? 0)));
+      const text = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+      if (this.compactTimer.textContent !== text) this.compactTimer.textContent = text;
+      this.compactTimer.classList.toggle("break", pomo.phase !== "focus");
+      this.compactTimer.classList.toggle("paused", pomo.running !== true);
+    }
+
     syncMiniBotStates(State.tasks);
     this.engine.setState(State.effectiveState);
   }
@@ -874,6 +1038,14 @@ export class Island {
     Sound.setEnabled(State.settings.soundEnabled);
     Sound.setVolume(State.settings.soundVolume);
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
+    const keep = State.settings.keepVisible === true;
+    const turnedOn = keep && !this.fsm.keepVisible;
+    this.fsm.keepVisible = keep;
+    if (turnedOn) {
+      // Bring it back now, and cancel a hide that was already counting down.
+      this.fsm.cancelTimers();
+      if (this.fsm.state === "hidden") this.fsm.reveal();
+    }
     State.notify();
   }
 

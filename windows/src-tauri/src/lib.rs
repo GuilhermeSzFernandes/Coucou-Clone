@@ -2,10 +2,17 @@
 
 mod claude;
 mod files;
+mod groq;
 mod hooks;
+mod hotkey;
 mod integrations;
 mod island;
 mod log;
+mod media;
+mod memory;
+mod notes;
+mod brain;
+mod today;
 mod pipe;
 mod secrets;
 mod settings;
@@ -93,6 +100,13 @@ fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
     let pref = shared.settings.lock().unwrap().screen.clone();
     shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
     island::apply_geometry(&app, &pref, collapsed);
+    // Main thread: RevokeDragDrop must run where the drop target was registered.
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || island::unblock_webview_drops(&handle));
+    // Folded away: let WebView2 trim. Opening: back to normal before it draws.
+    if let Some(win) = island::window(&app) {
+        memory::set_low_memory(&win, collapsed);
+    }
     // The wake strip must always take the mouse, and a resize invalidates the flag.
     island::set_ignore_cursor(&app, false);
     shared.gate.forget_ignore_state();
@@ -132,8 +146,28 @@ fn open_url(url: String) {
         .spawn();
 }
 
-/// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
-/// and falls back to Explorer otherwise.
+/// "Open terminal" opens a new Windows Terminal tab in the session's folder.
+/// Windows Terminal has no public way to focus an existing tab, so a new tab in
+/// the most recent window is the closest thing. Falls back to VS Code, then
+/// Explorer, when Windows Terminal is not installed.
+#[tauri::command]
+fn open_terminal(path: Option<String>) -> bool {
+    let dir = path.as_deref().filter(|p| !p.is_empty());
+    // `wt` is an app execution alias; CreateProcess resolves it from PATH, and
+    // no shell is involved. `;` separates wt commands, so it is escaped.
+    let mut wt = Command::new("wt.exe");
+    wt.args(["-w", "0", "nt"]);
+    if let Some(p) = dir {
+        wt.arg("-d").arg(p.replace(';', "\\;"));
+    }
+    if wt.spawn().is_ok() {
+        return true;
+    }
+    open_in_vscode(path)
+}
+
+/// Opens the working folder in VS Code when `code` is on PATH, and falls back to
+/// Explorer otherwise.
 #[tauri::command]
 fn open_in_vscode(path: Option<String>) -> bool {
     // No `cmd /C` anywhere near this. The path is a project folder chosen by
@@ -248,13 +282,201 @@ async fn chat_send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let (provider, model, groq_model, vault, use_brain) = {
+        let s = shared.settings.lock().unwrap();
+        (s.provider.clone(), s.model.clone(), s.groq_model.clone(), s.notes_vault.clone(), s.brain_chat)
+    };
+    chat.use_provider(&provider);
+
+    // The chat that knows you: profile, recent diary and the notes about this
+    // question, read from the vault. Looked up for every turn, so a follow-up
+    // question finds its own notes.
+    let found = if use_brain && !vault.trim().is_empty() {
+        let q = query.clone();
+        tauri::async_runtime::spawn_blocking(move || brain::context_for(&vault, &q))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let (brain_text, sources) = match found {
+        Some(b) => (Some(b.text), b.sources),
+        None => (None, Vec::new()),
+    };
+
+    let mut reply = if provider == "groq" {
+        groq::send(&chat, &groq_model, query, context, brain_text.as_deref()).await?
+    } else {
+        claude::send(&chat, &model, query, context, brain_text.as_deref()).await?
+    };
+    reply.sources = sources;
+    Ok(reply)
 }
 
 #[tauri::command]
 fn chat_reset(chat: State<Chat>) {
     chat.reset();
+}
+
+/// Calendar pill: downloads the secret iCal feed (Google Calendar's "secret
+/// address in iCal format"). The link stays in the Credential Manager and is
+/// never logged; the island only receives the calendar text and parses it.
+/// `slot` is 1–8, one per calendar in Settings → Calendars.
+#[tauri::command]
+async fn calendar_fetch(slot: Option<u8>) -> Result<String, String> {
+    if integrations::PAUSED.load(Ordering::Relaxed) {
+        return Err("Paused".to_string());
+    }
+    let key = match slot.unwrap_or(1) {
+        1 => "gcal-ics-url".to_string(),
+        n @ 2..=8 => format!("gcal-ics-url-{n}"),
+        _ => return Err("Unknown calendar".to_string()),
+    };
+    let url = secrets::get(&key)
+        .ok_or_else(|| "Calendar link missing. Open settings.".to_string())?;
+    if !url.starts_with("https://") {
+        return Err("The calendar link must start with https://".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Coucou")
+        .send()
+        .await
+        .map_err(|_| "Network error while loading the calendar".to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        log::line(format!("calendar HTTP {}", status.as_u16()));
+        return Err(format!("Calendar link refused ({})", status.as_u16()));
+    }
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return Err("Calendar too large".to_string());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+// ── Second brain (Obsidian) ───────────────────────────────────────────────────
+
+/// Asks Groq how to file a quick note. Nothing is written yet.
+#[tauri::command]
+async fn note_classify(
+    shared: State<'_, Shared>,
+    text: String,
+    now: notes::Now,
+) -> Result<serde_json::Value, String> {
+    let (vault, model) = {
+        let s = shared.settings.lock().unwrap();
+        (s.notes_vault.clone(), s.groq_model.clone())
+    };
+    notes::classify(&vault, &model, text, &now).await
+}
+
+/// Writes a classified note into the vault.
+#[tauri::command]
+fn note_write(
+    shared: State<'_, Shared>,
+    plan: serde_json::Value,
+    original: String,
+    now: notes::Now,
+    calendar_url: Option<String>,
+) -> Result<notes::Written, String> {
+    let vault = shared.settings.lock().unwrap().notes_vault.clone();
+    notes::write(&vault, &plan, &original, &now, calendar_url.as_deref())
+}
+
+/// Takes one save back.
+#[tauri::command]
+fn note_undo(shared: State<'_, Shared>, written: notes::Written) -> Result<(), String> {
+    let vault = shared.settings.lock().unwrap().notes_vault.clone();
+    notes::undo(&vault, &written)
+}
+
+#[tauri::command]
+fn note_open(path: String) -> bool {
+    notes::open_in_obsidian(&path)
+}
+
+#[tauri::command]
+fn notes_default_vault() -> String {
+    notes::default_vault()
+}
+
+// ── Meu dia: pending items, Claude Code activity, the daily ───────────────────
+
+#[tauri::command]
+fn activity_append(date: String, entry: today::Activity) -> Result<(), String> {
+    today::activity_append(&date, &entry)
+}
+
+#[tauri::command]
+async fn today_pending(shared: State<'_, Shared>) -> Result<Vec<today::Pending>, String> {
+    let vault = shared.settings.lock().unwrap().notes_vault.clone();
+    tauri::async_runtime::spawn_blocking(move || today::pending(&vault))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn today_done(shared: State<'_, Shared>, item: today::Pending) -> Result<(), String> {
+    let vault = shared.settings.lock().unwrap().notes_vault.clone();
+    today::mark_done(&vault, &item)
+}
+
+#[tauri::command]
+async fn daily_generate(
+    shared: State<'_, Shared>,
+    dates: Vec<String>,
+    today_label: String,
+    calendar: String,
+) -> Result<String, String> {
+    let (vault, model) = {
+        let s = shared.settings.lock().unwrap();
+        (s.notes_vault.clone(), s.groq_model.clone())
+    };
+    today::generate(&vault, &model, &dates, &today_label, &calendar).await
+}
+
+#[tauri::command]
+fn daily_save(shared: State<'_, Shared>, date: String, text: String) -> Result<String, String> {
+    let vault = shared.settings.lock().unwrap().notes_vault.clone();
+    today::save(&vault, &date, &text)
+}
+
+/// Rewrites "Perfil (gerado).md" from the latest notes.
+#[tauri::command]
+async fn brain_refresh_profile(shared: State<'_, Shared>, date: String) -> Result<String, String> {
+    let (vault, model) = {
+        let s = shared.settings.lock().unwrap();
+        (s.notes_vault.clone(), s.groq_model.clone())
+    };
+    brain::refresh_profile(&vault, &model, &date).await
+}
+
+/// Media pill buttons: "toggle", "next" or "previous".
+#[tauri::command]
+fn media_control(action: String) {
+    media::control(action);
+}
+
+/// "Attach file": the standard Open dialog, as an alternative to dragging.
+#[tauri::command]
+async fn pick_file() -> Option<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(files::pick());
+    });
+    rx.await.ok().flatten()
+}
+
+/// Chat: a screenshot pasted with Ctrl+V, saved into the inbox.
+#[tauri::command]
+fn save_pasted_image(data: String, ext: String) -> Result<DroppedFile, String> {
+    files::save_pasted(&data, &ext)
 }
 
 /// Copies a dropped file into the inbox and reports its name back.
@@ -306,7 +528,7 @@ fn log_line(message: String) {
 /// for the *same* arguments as the island (see `additionalBrowserArgs` in
 /// tauri.conf.json) — a mismatch makes the second window come up blank, with no
 /// error anywhere.
-const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
+const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --renderer-process-limit=1";
 
 /// In a dev build the pages are served by Vite, so the second window needs the
 /// absolute dev URL; a bundled build resolves it inside the app bundle.
@@ -338,11 +560,22 @@ fn create_settings_window(app: &AppHandle) {
     {
         Ok(win) => {
             // Closing it must only hide it, or it could never be reopened.
+            // Hidden, its page is unloaded and WebView2 asked to trim.
             let hidden = win.clone();
             win.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = hidden.hide();
+                    memory::unload_settings(&hidden);
+                }
+            });
+            // It is created at launch only so that it works later; nobody is
+            // looking at it yet. Give it a moment to come up, then unload.
+            let idle = win.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if !idle.is_visible().unwrap_or(false) {
+                    memory::unload_settings(&idle);
                 }
             });
         }
@@ -355,6 +588,7 @@ pub fn show_settings_window(app: &AppHandle) {
         log::line("settings window missing");
         return;
     };
+    memory::reload_settings(&win);
     let _ = win.unminimize();
     let _ = win.show();
     let _ = win.set_focus();
@@ -389,6 +623,7 @@ pub fn run() {
             reposition,
             open_url,
             open_in_vscode,
+            open_terminal,
             quit_app,
             hooks_status,
             hooks_preview,
@@ -398,6 +633,21 @@ pub fn run() {
             approval_decline,
             log_line,
             chat_send,
+            pick_file,
+            save_pasted_image,
+            media_control,
+            calendar_fetch,
+            note_classify,
+            note_write,
+            note_undo,
+            note_open,
+            notes_default_vault,
+            brain_refresh_profile,
+            activity_append,
+            today_pending,
+            today_done,
+            daily_generate,
+            daily_save,
             chat_reset,
             ingest_file,
             secret_present,
@@ -422,11 +672,14 @@ pub fn run() {
             gate.collapsed.store(false, Ordering::Relaxed);
             gate.set_active(true);
             island::spawn_cursor_poll(handle.clone(), gate.clone());
+            island::spawn_drop_guard(handle.clone());
 
             log::line(format!("--- Coucou {} started ---", env!("CARGO_PKG_VERSION")));
             hooks::ensure_hook_exe(&handle);
             pipe::start(handle.clone());
             integrations::start(handle.clone());
+            media::start(handle.clone());
+            hotkey::start(handle.clone());
             Ok(())
         })
         .run(tauri::generate_context!())

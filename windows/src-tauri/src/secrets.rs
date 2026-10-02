@@ -8,6 +8,7 @@ const SERVICE: &str = "fr.louisraille.coucou";
 /// Every key Coucou may store. Anything outside this list is refused.
 pub const KNOWN_KEYS: &[&str] = &[
     "anthropic-api-key",
+    "groq-api-key",
     "n8n-url",
     "n8n-api-key",
     "vercel-token",
@@ -16,6 +17,15 @@ pub const KNOWN_KEYS: &[&str] = &[
     "resend-api-key",
     "notion-api-key",
     "calcom-api-key",
+    // Calendar links: slot 1 keeps its original name, slots 2–8 are numbered.
+    "gcal-ics-url",
+    "gcal-ics-url-2",
+    "gcal-ics-url-3",
+    "gcal-ics-url-4",
+    "gcal-ics-url-5",
+    "gcal-ics-url-6",
+    "gcal-ics-url-7",
+    "gcal-ics-url-8",
 ];
 
 fn entry(key: &str) -> Option<Entry> {

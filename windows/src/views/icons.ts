@@ -2,6 +2,10 @@
 // Drawn on a 24×24 grid so they read at the same optical size.
 
 export const ICONS = {
+  checklist: "M3.5 5.5 5 7l2.5-3 1.2 1L5 9.3 2.3 6.6l1.2-1.1zM11 6h10v2H11V6zm-7.5 6.5L5 14l2.5-3 1.2 1L5 16.3l-2.7-2.7 1.2-1.1zM11 13h10v2H11v-2zm-6 4h3v3H5v-3zm6 1h10v2H11v-2z",
+  notebook: "M6 2.5h11.5A1.5 1.5 0 0 1 19 4v16a1.5 1.5 0 0 1-1.5 1.5H6V2.5zm2 2V19.5h9V4.5H8zm2 2.5h5v2h-5V7zm0 4h5v2h-5v-2zM4 6h3v2H4V6zm0 5h3v2H4v-2zm0 5h3v2H4v-2z",
+  reload: "M12 5a7 7 0 1 0 6.93 8h-2.03A5 5 0 1 1 12 7c1.38 0 2.63.56 3.54 1.46L13 11h7V4l-2.04 2.04A6.97 6.97 0 0 0 12 5z",
+  calendar: "M7 2h2v2h6V2h2v2h3.5v17.5h-17V4H7V2zM5.5 9v10.5h13V9h-13zm2 2.5h3v3h-3v-3z",
   // house.fill
   house: "M12 3.2 2.8 10.6V21h6.6v-5.4h5.2V21h6.6V10.6L12 3.2z",
   // bubble.left.fill

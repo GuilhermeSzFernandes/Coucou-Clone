@@ -52,6 +52,8 @@ export const Bridge = {
 
   /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
   openInVSCode: (path: string | null) => call<boolean>("open_in_vscode", { path }),
+  /** "Open terminal" → new Windows Terminal tab in the folder (VS Code / Explorer as fallback). */
+  openTerminal: (path: string | null) => call<boolean>("open_terminal", { path }),
 
   quit: () => call<void>("quit_app"),
 
@@ -81,10 +83,43 @@ export const Bridge = {
   // ── Chat, files, secrets ──────────────────────────────────────────────────
   /** One chat turn. The API key and any file bytes never leave Rust. */
   chatSend: (query: string, context: ChatContext | null) =>
-    callOrThrow<{ text: string }>("chat_send", { query, context }),
+    callOrThrow<{ text: string; sources?: { title: string; path: string }[] }>("chat_send", { query, context }),
   chatReset: () => call<void>("chat_reset"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
+  /** Opens the Windows "Open" dialog; null when cancelled. */
+  pickFile: () => call<string | null>("pick_file"),
+  /** Second brain: classify, write, undo, open in Obsidian. */
+  noteClassify: (text: string, now: { date: string; time: string; weekday: string }) =>
+    callOrThrow<NotePlan>("note_classify", { text, now }),
+  noteWrite: (
+    plan: NotePlan,
+    original: string,
+    now: { date: string; time: string; weekday: string },
+    calendarUrl: string | null = null,
+  ) => callOrThrow<NoteWritten>("note_write", { plan, original, now, calendarUrl }),
+  /** Meu dia: pending items, tick one off, write and save the daily. */
+  todayPending: () => callOrThrow<PendingItem[]>("today_pending"),
+  todayDone: (item: PendingItem) => callOrThrow<void>("today_done", { item }),
+  dailyGenerate: (dates: string[], todayLabel: string, calendar: string) =>
+    callOrThrow<string>("daily_generate", { dates, todayLabel, calendar }),
+  dailySave: (date: string, text: string) => callOrThrow<string>("daily_save", { date, text }),
+  /** Claude Code activity of the day (what was asked, what finished) for the daily. */
+  activityAppend: (date: string, entry: { time: string; project: string; kind: string; text: string }) =>
+    call<void>("activity_append", { date, entry }),
+
+  noteUndo: (written: NoteWritten) => callOrThrow<void>("note_undo", { written }),
+  noteOpen: (path: string) => call<boolean>("note_open", { path }),
+  notesDefaultVault: () => call<string>("notes_default_vault"),
+  /** Rewrites "Perfil (gerado).md" from the latest notes; returns its path. */
+  brainRefreshProfile: (date: string) => callOrThrow<string>("brain_refresh_profile", { date }),
+  /** Ctrl+V of a screenshot in the chat: saved into the inbox. */
+  savePastedImage: (data: string, ext: string) =>
+    callOrThrow<DroppedFile>("save_pasted_image", { data, ext }),
+  /** Calendar pill: the iCal text behind the secret link (the link stays in Rust). */
+  calendarFetch: (slot = 1) => callOrThrow<string>("calendar_fetch", { slot }),
+  /** Media pill: play/pause, next, previous on whatever Windows says is playing. */
+  mediaControl: (action: "toggle" | "next" | "previous") => call<void>("media_control", { action }),
   /** Only ever tells you whether a key exists — never its value. */
   secretPresent: (key: string) => call<boolean>("secret_present", { key }),
   secretSet: (key: string, value: string) => callOrThrow<void>("secret_set", { key, value }),
@@ -109,6 +144,38 @@ export interface IntegrationUpdate {
 export type ChatContext =
   | { kind: "file"; name: string; path: string }
   | { kind: "window"; appName: string; title: string; url?: string };
+
+/** How Groq filed a quick note. */
+export interface NotePlan {
+  area: "Trabalho" | "TCC" | "Pessoal";
+  tipo: string;
+  titulo: string;
+  resumo: string;
+  entidades: { nome: string; tipo: string }[];
+  tags: string[];
+  chamado: string | null;
+  lembrete: { titulo: string; data: string; hora: string | null; duracaoMin: number } | null;
+}
+
+/** A to-do from the vault: a note with a due date, or a `- [ ]` line. */
+export interface PendingItem {
+  kind: "note" | "task";
+  title: string;
+  path: string;
+  line: number;
+  text: string;
+  due: string | null;
+  area: string | null;
+}
+
+/** What one save wrote into the vault (enough to undo it). */
+export interface NoteWritten {
+  path: string;
+  relative: string;
+  created: string[];
+  dailyPath: string;
+  dailyLine: string;
+}
 
 export interface DroppedFile {
   name: string;

@@ -4,7 +4,8 @@
 
 import "./settings.css";
 import { Bridge, onEvent, type HookStatus } from "../core/bridge";
-import { DEFAULT_SETTINGS, type Settings } from "../core/state";
+import { DEFAULT_CALENDARS, DEFAULT_SETTINGS, type CalendarSource, type Settings } from "../core/state";
+import { calendarKey, MAX_CALENDARS } from "../island/calendar";
 import { h, clear } from "../views/dom";
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
@@ -254,6 +255,126 @@ function apiSection(hasKey: boolean): HTMLElement {
   );
 }
 
+// ── Chat provider + Groq section ──────────────────────────────────────────────
+
+const GROQ_MODELS: [string, string][] = [
+  ["openai/gpt-oss-120b", "GPT-OSS 120B"],
+  ["openai/gpt-oss-20b", "GPT-OSS 20B (faster)"],
+  ["qwen/qwen3.8-27b", "Qwen 3.8 27B (reads images)"],
+];
+
+function providerSection(): HTMLElement {
+  const select = h("select", {}) as HTMLSelectElement;
+  select.append(
+    h("option", { value: "anthropic", text: "Claude (Anthropic)" }),
+    h("option", { value: "groq", text: "Groq" }),
+  );
+  select.value = settings.provider ?? "anthropic";
+  select.addEventListener("change", () => {
+    settings.provider = select.value === "groq" ? "groq" : "anthropic";
+    void save();
+  });
+  return h(
+    "section",
+    {},
+    h("h2", {}, h("span", { text: "Chat" })),
+    h("span", {
+      class: "hint",
+      text: "Which AI answers when you chat or drop a file. Switching starts a new conversation.",
+    }),
+    h("div", { class: "row" }, h("label", { text: "Provider" }), select),
+  );
+}
+
+function groqSection(hasKey: boolean): HTMLElement {
+  const dot = statusDot(hasKey);
+  const state = h("span", { class: "hint", text: "" });
+
+  const field = h("input", {
+    type: "password",
+    placeholder: "gsk_...",
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+
+  const saveBtn = h("button", { class: "primary", text: "Save key" });
+  const clearBtn = h("button", { class: "danger", text: "Remove" });
+  const feedback = h("div", {});
+
+  function paint(present: boolean) {
+    dot.style.background = present ? "#22c55e" : "#f4505e";
+    state.textContent = present
+      ? "Key saved in the Windows Credential Manager."
+      : "No Groq key yet. Get one at console.groq.com/keys.";
+    field.placeholder = present ? "••••••••••••  (stored)" : "gsk_...";
+    clearBtn.style.display = present ? "" : "none";
+  }
+
+  async function refresh() {
+    paint((await Bridge.secretPresent("groq-api-key")) ?? false);
+  }
+
+  saveBtn.addEventListener("click", async () => {
+    const value = field.value.trim();
+    if (!value) return;
+    clear(feedback);
+    try {
+      await Bridge.secretSet("groq-api-key", value);
+      field.value = "";
+      feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
+      await refresh();
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
+    }
+  });
+
+  clearBtn.addEventListener("click", async () => {
+    clear(feedback);
+    try {
+      await Bridge.secretClear("groq-api-key");
+      feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
+      await refresh();
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
+    }
+  });
+
+  // Free text with suggestions: Groq's model list changes often.
+  const listId = "groq-models";
+  const datalist = h("datalist", { id: listId });
+  for (const [id, label] of GROQ_MODELS) datalist.append(h("option", { value: id, text: label }));
+  const model = h("input", {
+    type: "text",
+    list: listId,
+    style: "flex:1 1 auto;min-width:0",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  model.value = settings.groqModel ?? "openai/gpt-oss-120b";
+  model.addEventListener("change", () => {
+    const v = model.value.trim();
+    if (!v) return;
+    settings.groqModel = v;
+    void save();
+  });
+
+  paint(hasKey);
+
+  return h(
+    "section",
+    {},
+    h("h2", {}, dot, h("span", { text: "Groq" })),
+    state,
+    h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
+    h("div", { class: "row" }, h("label", { text: "Model" }), model, datalist),
+    h("span", {
+      class: "hint",
+      text: "Model ids: console.groq.com/docs/models. Images need a vision model; PDFs are not supported.",
+    }),
+    feedback,
+  );
+}
+
 // ── Integrations section ──────────────────────────────────────────────────────
 
 interface IntegrationDef {
@@ -282,6 +403,11 @@ const INTEGRATIONS: IntegrationDef[] = [
     fields: [{ key: "notion-api-key", label: "Integration token", placeholder: "ntn_…", secret: true }] },
   { id: "integration_calcom", name: "Cal.com", color: "#C9956A",
     fields: [{ key: "calcom-api-key", label: "API key", placeholder: "cal_…", secret: true }] },
+  // No key: these two run entirely on this PC.
+  { id: "integration_pomodoro", name: "Pomodoro", color: "#EF6461", fields: [] },
+  { id: "integration_media", name: "Music", color: "#1DB954", fields: [] },
+  // Links, names and colours are in the Calendars section below.
+  { id: "integration_calendar", name: "Google Calendar", color: "#4285F4", fields: [] },
 ];
 
 const MAX_ACTIVE = 4;
@@ -358,6 +484,200 @@ function integrationsSection(present: Record<string, boolean>): HTMLElement {
   return h("section", {}, h("h2", {}, h("span", { text: "Integrations" })), note, list);
 }
 
+// ── Calendars section ─────────────────────────────────────────────────────────
+
+const CAL_PALETTE = ["#4285F4", "#22C55E", "#F4511E", "#A142F4", "#F6BF26", "#E67C73", "#039BE5", "#8E24AA"];
+
+function calendarsSection(present: Record<string, boolean>): HTMLElement {
+  if (!Array.isArray(settings.calendars) || settings.calendars.length === 0) {
+    settings.calendars = DEFAULT_CALENDARS.map((c) => ({ ...c }));
+  }
+  const list = h("div", { style: "display:flex;flex-direction:column;gap:8px" });
+  const addBtn = h("button", { text: "+ Add calendar" });
+  const feedback = h("div", {});
+
+  function render() {
+    clear(list);
+    for (const cal of settings.calendars) list.append(row(cal));
+    addBtn.style.display = settings.calendars.length >= MAX_CALENDARS ? "none" : "";
+  }
+
+  function row(cal: CalendarSource): HTMLElement {
+    const key = calendarKey(cal.slot);
+    const color = h("input", { type: "color", value: cal.color, title: "Colour of this calendar's events" }) as HTMLInputElement;
+    color.addEventListener("change", () => {
+      cal.color = color.value;
+      void save(); // the island repaints, no reload needed
+    });
+
+    const name = h("input", { type: "text", value: cal.name, spellcheck: "false", style: "width:110px" }) as HTMLInputElement;
+    name.addEventListener("change", () => {
+      cal.name = name.value.trim() || "Calendar";
+      name.value = cal.name;
+      void save();
+    });
+
+    const link = h("input", {
+      type: "password",
+      placeholder: present[key] ? "••••••••  (stored)" : "secret iCal link (…/basic.ics)",
+      autocomplete: "off",
+      spellcheck: "false",
+      style: "flex:1 1 auto;min-width:0",
+    }) as HTMLInputElement;
+    const dotEl = statusDot(present[key] ?? false);
+    const saveBtn = h("button", { text: "Save" });
+    saveBtn.addEventListener("click", async () => {
+      const value = link.value.trim();
+      clear(feedback);
+      if (value && !value.startsWith("https://")) {
+        feedback.append(h("div", { class: "notice err", text: "The link must start with https://" }));
+        return;
+      }
+      try {
+        await Bridge.secretSet(key, value);
+        present[key] = value.length > 0;
+        link.value = "";
+        link.placeholder = value ? "••••••••  (stored)" : "secret iCal link (…/basic.ics)";
+        dotEl.style.background = value ? "#22c55e" : "#f4505e";
+        cal.rev = (cal.rev ?? 0) + 1; // tells the island to download it again
+        void save();
+      } catch (err) {
+        feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
+      }
+    });
+
+    const removeBtn = h("button", { class: "danger", text: "Remove", title: "Remove this calendar and forget its link" });
+    removeBtn.addEventListener("click", async () => {
+      try {
+        await Bridge.secretClear(key);
+      } catch {
+        /* nothing stored */
+      }
+      present[key] = false;
+      settings.calendars = settings.calendars.filter((c) => c.slot !== cal.slot);
+      void save();
+      render();
+    });
+
+    return h("div", { class: "row" }, color, name, link, saveBtn, dotEl, removeBtn);
+  }
+
+  addBtn.addEventListener("click", () => {
+    const used = new Set(settings.calendars.map((c) => c.slot));
+    let slot = 1;
+    while (used.has(slot) && slot <= MAX_CALENDARS) slot++;
+    if (slot > MAX_CALENDARS) return;
+    const colour = CAL_PALETTE.find((c) => !settings.calendars.some((x) => x.color.toLowerCase() === c.toLowerCase()))
+      ?? CAL_PALETTE[slot % CAL_PALETTE.length];
+    settings.calendars = [...settings.calendars, { slot, name: `Calendar ${settings.calendars.length + 1}`, color: colour, rev: 0 }];
+    void save();
+    render();
+  });
+
+  render();
+  return h(
+    "section",
+    {},
+    h("h2", {}, h("span", { text: "Calendars" })),
+    h("div", {
+      class: "hint",
+      text: `Up to ${MAX_CALENDARS}. In Google Calendar: ⚙ Settings → pick the calendar → Integrate calendar → Secret address in iCal format. Each calendar's events use its colour. Links are stored in the Windows Credential Manager.`,
+    }),
+    list,
+    h("div", { class: "row" }, addBtn),
+    feedback,
+  );
+}
+
+// ── Notes (Obsidian) section ──────────────────────────────────────────────────
+
+function notesSection(): HTMLElement {
+  const path = h("input", {
+    type: "text",
+    value: settings.notesVault ?? "",
+    placeholder: "C:\\Users\\você\\Documents\\Obsidian\\Segundo Cérebro",
+    spellcheck: "false",
+    style: "flex:1 1 auto;min-width:0",
+  }) as HTMLInputElement;
+  path.addEventListener("change", () => {
+    settings.notesVault = path.value.trim();
+    void save();
+  });
+
+  const useDefault = h("button", { text: "Usar pasta padrão" });
+  useDefault.addEventListener("click", async () => {
+    const def = (await Bridge.notesDefaultVault()) ?? "";
+    if (!def) return;
+    path.value = def;
+    settings.notesVault = def;
+    void save();
+  });
+
+  const mode = h("select", {}) as HTMLSelectElement;
+  mode.append(
+    h("option", { value: "ask", text: "Mostrar um botão para eu confirmar" }),
+    h("option", { value: "auto", text: "Abrir o Google Agenda automaticamente" }),
+  );
+  mode.value = settings.reminderMode ?? "ask";
+  mode.addEventListener("change", () => {
+    settings.reminderMode = mode.value === "auto" ? "auto" : "ask";
+    void save();
+  });
+
+  return h(
+    "section",
+    {},
+    h("h2", {}, h("span", { text: "Notes (Obsidian)" })),
+    h("span", {
+      class: "hint",
+      text: "Ctrl+Alt+N anota qualquer coisa: o Groq classifica (Trabalho, TCC, Pessoal), cria a nota com links e registra no diário. Depois, no Obsidian: Open folder as vault → esta pasta.",
+    }),
+    h("div", { class: "row" }, h("label", { text: "Pasta do cofre" }), path, useDefault),
+    h("div", { class: "row" }, h("label", { text: "Notas com data" }), mode),
+    h("div", { class: "row" },
+      h("label", { text: "Chat me conhece" }),
+      toggle(settings.brainChat !== false, (v) => { settings.brainChat = v; void save(); }),
+      h("span", { class: "hint", text: "antes de responder, o chat lê seu perfil, o diário da semana e as notas sobre o assunto" }),
+    ),
+    profileRow(),
+    h("div", { class: "row" },
+      h("label", { text: "Resumo da manhã" }),
+      toggle(settings.morningSummary !== false, (v) => { settings.morningSummary = v; void save(); }),
+      h("span", { class: "hint", text: "uma vez por dia, de manhã, \"Meu dia\" abre sozinho com as pendências e a agenda" }),
+    ),
+    h("span", {
+      class: "hint",
+      text: "A classificação usa a chave e o modelo da seção Groq. O texto das notas é enviado ao Groq para isso.",
+    }),
+  );
+}
+
+/** "Update my profile": the AI rewrites Perfil (gerado).md from the notes. */
+function profileRow(): HTMLElement {
+  const btn = h("button", { text: "Atualizar meu perfil agora" });
+  const status = h("span", { class: "hint", text: "o perfil é o resumo de quem você é que o chat sempre lê" });
+  let lastPath = "";
+  const open = h("button", { text: "Abrir perfil" });
+  open.style.display = "none";
+  open.addEventListener("click", () => { if (lastPath) void Bridge.noteOpen(lastPath); });
+  btn.addEventListener("click", async () => {
+    (btn as HTMLButtonElement).disabled = true;
+    status.textContent = "Lendo suas notas e escrevendo o perfil…";
+    try {
+      const d = new Date();
+      const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      lastPath = await Bridge.brainRefreshProfile(date);
+      status.textContent = "Perfil atualizado. Corrija ou complete à mão no Perfil.md (esse nunca é reescrito).";
+      open.style.display = "";
+    } catch (err) {
+      status.textContent = String(err).replace(/^Error:\s*/, "");
+    } finally {
+      (btn as HTMLButtonElement).disabled = false;
+    }
+  });
+  return h("div", { class: "row" }, h("label", { text: "Perfil" }), btn, open, status);
+}
+
 // ── General section ───────────────────────────────────────────────────────────
 
 function generalSection(): HTMLElement {
@@ -407,6 +727,11 @@ function generalSection(): HTMLElement {
       h("span", { class: "hint", text: "seconds after you leave the island" }),
     ),
     h("div", { class: "row" },
+      h("label", { text: "Always show the island" }),
+      toggle(settings.keepVisible === true, (v) => { settings.keepVisible = v; void save(); }),
+      h("span", { class: "hint", text: "the compact island stays on screen when nothing is running" }),
+    ),
+    h("div", { class: "row" },
       h("label", { text: "Island lives on" }),
       screen,
     ),
@@ -430,11 +755,13 @@ async function main() {
   };
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
+  const hasGroqKey = (await Bridge.secretPresent("groq-api-key")) ?? false;
 
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",
     "n8n-url", "n8n-api-key", "resend-api-key", "notion-api-key", "calcom-api-key",
   ];
+  for (let slot = 1; slot <= MAX_CALENDARS; slot++) keys.push(calendarKey(slot));
   const present: Record<string, boolean> = {};
   for (const k of keys) present[k] = (await Bridge.secretPresent(k)) ?? false;
 
@@ -442,8 +769,12 @@ async function main() {
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
+    providerSection(),
     apiSection(hasKey),
+    groqSection(hasGroqKey),
     integrationsSection(present),
+    calendarsSection(present),
+    notesSection(),
     generalSection(),
     h("div", {
       class: "hint",

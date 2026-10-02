@@ -265,3 +265,23 @@ select option {
   background: rgba(245, 165, 36, 0.13);
   color: #fbc06a;
 }
+
+input[type="color"] {
+  width: 28px;
+  height: 24px;
+  flex: 0 0 28px;
+  padding: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: transparent;
+  cursor: default;
+}
+
+input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+input[type="color"]::-webkit-color-swatch {
+  border: 0;
+  border-radius: 4px;
+}

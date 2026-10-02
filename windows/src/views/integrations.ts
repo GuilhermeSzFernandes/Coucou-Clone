@@ -8,6 +8,8 @@ import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
 import { State, type AgentTask } from "../core/state";
 import { Bridge } from "../core/bridge";
+import { Pomodoro } from "../island/pomodoro";
+import { CalendarStore } from "../island/calendar";
 
 /** Same shape as the Swift `timeAgo` computed properties. */
 export function timeAgo(value: unknown): string {
@@ -51,6 +53,7 @@ const OPEN_URLS: Record<string, string> = {
   integration_stripe: "https://dashboard.stripe.com/payments",
   integration_notion: "https://notion.so",
   integration_calcom: "https://app.cal.com/bookings",
+  integration_calendar: "https://calendar.google.com",
 };
 
 function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
@@ -69,8 +72,8 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
       h("button", {
         class: "link-btn",
         style: `color:${task.color}b3`,
-        text: "Open Visual Studio Code",
-        onclick: () => void Bridge.openInVSCode(task.sessionCwd ?? null),
+        text: "Open terminal",
+        onclick: () => void Bridge.openTerminal(task.sessionCwd ?? null),
       }),
     );
   } else if (task.id === "integration_n8n") {
@@ -110,7 +113,7 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   return h(
     "div",
     { class: "int-card" },
-    header(task.color, task.id === "integration_claude" ? "VS Code" : task.name, "Integration"),
+    header(task.color, task.id === "integration_claude" ? "Claude Code" : task.name, "Integration"),
     h("div", { class: "int-status" }, dot(statusColor, 5), h("span", { text: label })),
     actions,
   );
@@ -211,21 +214,182 @@ function statRow(icon: string, color: string, label: string, value: string): HTM
   );
 }
 
+/** Pull-request glyph (filled, 24×24 like the other icons). */
+const PR_ICON =
+  "M6 2.5a2.5 2.5 0 0 1 1 4.8v9.4a2.5 2.5 0 1 1-2 0V7.3a2.5 2.5 0 0 1 1-4.8zM18 16.7V9.5c0-1.1-.9-2-2-2h-2.6l1.8 1.8-1.4 1.4L9.6 6.5l4.2-4.2 1.4 1.4-1.8 1.8H16c2.2 0 4 1.8 4 4v7.2a2.5 2.5 0 1 1-2 0z";
+
 function githubCard(): HTMLElement {
   const d = get("integration_github");
-  const stars = Number(d.totalStars ?? 0);
-  const repos = Number(d.totalRepos ?? 0);
-  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+  // null = the search failed; show a dash rather than a fake zero.
+  const count = (v: unknown) =>
+    typeof v === "number" ? (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v)) : "—";
   return h(
     "div",
     { class: "int-card" },
-    header("#F4505E", "GitHub", "Overview"),
+    header("#F4505E", "GitHub", "Pull requests"),
     h(
       "div",
       { class: "int-stats" },
-      statRow(ICONS.star, "#F5A524", "Total stars", fmt(stars)),
-      statRow(ICONS.stack, "#6B7079", "Repositories", String(repos)),
+      statRow(PR_ICON, "#22C55E", "Open", count(d.prsOpen)),
+      statRow(PR_ICON, "#A371F7", "Closed", count(d.prsClosed)),
     ),
+  );
+}
+
+// ── Pomodoro ──────────────────────────────────────────────────────────────────
+
+const MEDIA_ICONS = {
+  play: "M8 5.2v13.6L18.6 12 8 5.2z",
+  pause: "M7 5h3.6v14H7V5zm6.4 0H17v14h-3.6V5z",
+  next: "M5.5 5.6v12.8l8.8-6.4-8.8-6.4zM15.6 5.6h2.6v12.8h-2.6V5.6z",
+  previous: "M18.5 5.6v12.8L9.7 12l8.8-6.4zM5.8 5.6h2.6v12.8H5.8V5.6z",
+  reset: "M12 5a7 7 0 1 1-6.6 4.7l1.9.6A5 5 0 1 0 12 7v2.6L8 6l4-3.6V5z",
+};
+
+function ctl(icon: string, title: string, onclick: () => void, primary = false): HTMLElement {
+  return h(
+    "button",
+    { class: primary ? "int-ctl primary" : "int-ctl", title, onclick: (e: Event) => { e.stopPropagation(); onclick(); } },
+    svg(icon, primary ? 12 : 11),
+  );
+}
+
+function mmss(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function pomodoroCard(): HTMLElement {
+  const d = get("integration_pomodoro");
+  const phase = String(d.phase ?? "focus");
+  const running = d.running === true;
+  const remaining = Number(d.remaining ?? 1500);
+  const total = Math.max(1, Number(d.total ?? 1500));
+  const done = Number(d.done ?? 0);
+  const label = phase === "focus" ? "Focus" : phase === "long" ? "Long break" : "Break";
+  const color = phase === "focus" ? "#EF6461" : "#22C55E";
+
+  const bar = h("div", { class: "pomo-bar" }, h("i", {
+    style: `width:${((total - remaining) / total) * 100}%;background:${color}`,
+  }));
+
+  return h(
+    "div",
+    { class: "int-card" },
+    header("#EF6461", "Pomodoro", label, h("span", { class: "int-total", text: `${done} done` })),
+    h(
+      "div",
+      { class: "pomo-row" },
+      h("span", { class: "pomo-time", text: mmss(remaining) }),
+      h(
+        "div",
+        { class: "int-ctls" },
+        ctl(MEDIA_ICONS.reset, "Reset", () => Pomodoro.reset()),
+        ctl(running ? MEDIA_ICONS.pause : MEDIA_ICONS.play, running ? "Pause" : "Start", () => Pomodoro.toggle(), true),
+        ctl(MEDIA_ICONS.next, "Skip", () => Pomodoro.skip()),
+      ),
+    ),
+    bar,
+  );
+}
+
+// ── Music ─────────────────────────────────────────────────────────────────────
+
+/** Cover of the current track (data: URL), kept out of State on purpose. */
+let mediaArt: string | null = null;
+
+export function setMediaArt(url: string | null) {
+  mediaArt = url;
+}
+
+function mediaCard(): HTMLElement {
+  const d = get("integration_media");
+  if (d.active !== true) {
+    return h(
+      "div",
+      { class: "int-card" },
+      header("#1DB954", "Music", "Idle"),
+      h("div", { class: "int-status", text: "Nothing playing. Start music in Spotify, a browser or any player." }),
+    );
+  }
+  const playing = d.playing === true;
+  const cover = mediaArt
+    ? h("img", { class: "media-art", src: mediaArt, alt: "" })
+    : h("div", { class: "media-art empty" }, svg(MEDIA_ICONS.play, 14));
+
+  return h(
+    "div",
+    { class: "int-card" },
+    header("#1DB954", "Music", String(d.app || "Playing")),
+    h(
+      "div",
+      { class: "media-row" },
+      cover,
+      h(
+        "div",
+        { class: "media-text" },
+        h("span", { class: "media-title", text: String(d.title || "Unknown title") }),
+        h("span", { class: "media-artist", text: String(d.artist || "") }),
+        h(
+          "div",
+          { class: "int-ctls" },
+          ctl(MEDIA_ICONS.previous, "Previous", () => void Bridge.mediaControl("previous")),
+          ctl(playing ? MEDIA_ICONS.pause : MEDIA_ICONS.play, playing ? "Pause" : "Play",
+            () => void Bridge.mediaControl("toggle"), true),
+          ctl(MEDIA_ICONS.next, "Next", () => void Bridge.mediaControl("next")),
+        ),
+      ),
+    ),
+  );
+}
+
+// ── Google Calendar ───────────────────────────────────────────────────────────
+
+const fmtCalTime = new Intl.DateTimeFormat(navigator.language || "pt-BR", { hour: "2-digit", minute: "2-digit" });
+const fmtCalDay = new Intl.DateTimeFormat(navigator.language || "pt-BR", { weekday: "short" });
+
+function calendarCard(hooks: IntegrationCardHooks): HTMLElement {
+  const d = get("integration_calendar");
+  const today = Number(d.today ?? 0);
+  const upcoming = Array.isArray(d.upcoming)
+    ? (d.upcoming as { title: string; start: number; allDay: boolean; color?: string }[])
+    : [];
+  const rows = h("div", { class: "int-rows" });
+  const todayKey = new Date().toDateString();
+  upcoming.slice(0, 2).forEach((e, i) => {
+    const start = new Date(e.start);
+    const sameDay = start.toDateString() === todayKey;
+    const when = e.allDay ? (sameDay ? "All day" : fmtCalDay.format(start)) : sameDay
+      ? fmtCalTime.format(start)
+      : `${fmtCalDay.format(start)} ${fmtCalTime.format(start)}`;
+    rows.append(listRow(e.color ?? "#4285F4", i === 0,
+      h("span", { class: "int-ago", text: when }),
+      h("span", { class: "int-name", text: e.title })));
+  });
+  if (upcoming.length === 0) rows.append(h("div", { class: "int-status", text: "Nothing in the next 7 days." }));
+
+  const open = h("button", {
+    class: "link-btn",
+    style: "color:#8ab4f8",
+    text: "Open calendar",
+    onclick: (e: Event) => { e.stopPropagation(); hooks.openCalendar(); },
+  });
+  const reload = h("button", {
+    class: "link-btn",
+    style: "color:#8ab4f8",
+    text: "Reload",
+    onclick: (e: Event) => {
+      e.stopPropagation();
+      reload.textContent = "Reloading…";
+      void CalendarStore.refresh(true);
+    },
+  });
+  return h(
+    "div",
+    { class: "int-card" },
+    header("#4285F4", "Calendar", today === 1 ? "1 today" : `${today} today`),
+    rows,
+    h("div", { class: "int-actions" }, open, reload),
   );
 }
 
@@ -375,6 +539,7 @@ function n8nDetail(task: AgentTask, onBack: () => void): HTMLElement {
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 export interface IntegrationCardHooks {
+  openCalendar(): void;
   detailOpen: boolean;
   openDetail(): void;
   closeDetail(): void;
@@ -383,6 +548,8 @@ export interface IntegrationCardHooks {
 
 /** True when this integration has data worth showing instead of the idle card. */
 export function hasIntegrationData(id: string): boolean {
+  // Local pills: always have something to show, no key involved.
+  if (id === "integration_pomodoro" || id === "integration_media") return true;
   const info = State.integrations[id];
   if (!info || info.error) return false;
   switch (id) {
@@ -391,13 +558,15 @@ export function hasIntegrationData(id: string): boolean {
     case "integration_resend":
       return arr(id, "emails").length > 0;
     case "integration_github":
-      return get(id).totalRepos != null;
+      return "prsOpen" in get(id);
     case "integration_stripe":
       return info.loaded;
     case "integration_notion":
       return arr(id, "pages").length > 0;
     case "integration_calcom":
       return info.loaded;
+    case "integration_calendar":
+      return info.loaded && get(id).loaded === true;
     default:
       return false;
   }
@@ -426,6 +595,12 @@ export function renderIntegrationCard(task: AgentTask, hooks: IntegrationCardHoo
       return notionCard();
     case "integration_calcom":
       return calcomCard();
+    case "integration_pomodoro":
+      return pomodoroCard();
+    case "integration_media":
+      return mediaCard();
+    case "integration_calendar":
+      return calendarCard(hooks);
     default:
       return idleCard(task, hooks.openSettings);
   }

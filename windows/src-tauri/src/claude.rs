@@ -18,7 +18,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MAX_TOKENS: u32 = 4096;
 /// Text and code files are inlined; anything larger is skipped, as on macOS.
-const MAX_INLINE_TEXT: u64 = 200_000;
+pub(crate) const MAX_INLINE_TEXT: u64 = 200_000;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
@@ -31,6 +31,9 @@ No markdown formatting (no **, no ##, no bullet dashes). Use plain text with lin
 pub struct Chat {
     /// Full multi-turn history, including tool_use / tool_result blocks.
     messages: Mutex<Vec<Value>>,
+    /// Provider the history was written for. Claude and Groq store messages in
+    /// different shapes, so switching provider starts a fresh conversation.
+    provider: Mutex<String>,
 }
 
 impl Chat {
@@ -38,19 +41,28 @@ impl Chat {
         self.messages.lock().unwrap().clear();
     }
 
-    fn is_empty(&self) -> bool {
+    /// Clears the history when it belongs to another provider.
+    pub(crate) fn use_provider(&self, provider: &str) {
+        let mut current = self.provider.lock().unwrap();
+        if *current != provider {
+            self.messages.lock().unwrap().clear();
+            *current = provider.to_string();
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.messages.lock().unwrap().is_empty()
     }
 
-    fn push(&self, message: Value) {
+    pub(crate) fn push(&self, message: Value) {
         self.messages.lock().unwrap().push(message);
     }
 
-    fn pop(&self) {
+    pub(crate) fn pop(&self) {
         self.messages.lock().unwrap().pop();
     }
 
-    fn snapshot(&self) -> Vec<Value> {
+    pub(crate) fn snapshot(&self) -> Vec<Value> {
         self.messages.lock().unwrap().clone()
     }
 }
@@ -66,6 +78,8 @@ pub enum ChatContext {
 #[serde(rename_all = "camelCase")]
 pub struct ChatReply {
     pub text: String,
+    /// Notes of the second brain this answer was given (empty when none).
+    pub sources: Vec<crate::brain::Source>,
 }
 
 /// One chat turn. Returns the assistant's text, or a message the island shows
@@ -75,6 +89,7 @@ pub async fn send(
     model: &str,
     query: String,
     context: Option<ChatContext>,
+    brain: Option<&str>,
 ) -> Result<ChatReply, String> {
     let key = secrets::get("anthropic-api-key")
         .ok_or_else(|| "API key missing. Open settings.".to_string())?;
@@ -108,7 +123,7 @@ pub async fn send(
     let body = json!({
         "model": model,
         "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
+        "system": format!("{SYSTEM_PROMPT}{}", brain.unwrap_or("")),
         "tools": [{ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }],
         "fallbacks": "default",
         "messages": chat.snapshot(),
@@ -154,7 +169,7 @@ pub async fn send(
     if text.is_empty() {
         return Err("No response text.".into());
     }
-    Ok(ChatReply { text })
+    Ok(ChatReply { text, sources: Vec::new() })
 }
 
 async fn call(key: &str, body: &Value) -> Result<Value, String> {
